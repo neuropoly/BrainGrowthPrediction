@@ -21,7 +21,7 @@ FOLD=$SLURM_ARRAY_TASK_ID
 
 # Base dirs
 BASE=$HOME/scratch/bgp
-OUT_ROOT=ae_folds_output
+OUT_ROOT=ae_folds_output_NEW
 OUT_DIR=${BASE}/${OUT_ROOT}/fold_${FOLD}
 mkdir -p "$OUT_DIR"
 
@@ -29,6 +29,7 @@ mkdir -p "$OUT_DIR"
 python /home/andim/BrainGrowthPrediction/scripts/train/train_autoencoder_folds.py \
   --dataset_csv /home/andim/projects/def-bedelb/andim/brlp-data/datasets_complete_with_cv_splits.csv \
   --n_epochs 400 \
+  --perceptual_weight 0.25 \
   --max_batch_size 3 \
   --batch_size 27 \
   --fold "$FOLD" \

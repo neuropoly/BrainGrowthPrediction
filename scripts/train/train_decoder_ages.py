@@ -131,10 +131,150 @@ def log_recon_3x4_to_wandb(
     plt.savefig(tmp, dpi=120)
     plt.close(fig)
     if step is not None:
-        wandb.log({tag: wandb.Image(tmp)}, step=step)
+        wandb.log({"opt_step": step, tag: wandb.Image(tmp)})
     else:
         wandb.log({tag: wandb.Image(tmp)})
     os.remove(tmp)
+
+def log_recon_3x7_to_wandb(
+    meta: dict,
+    t1_vol_np: np.ndarray,
+    t1_recon_np: np.ndarray,
+    t2_recon_np: np.ndarray,
+    t2_true_np: np.ndarray,
+    t2_pred_np: np.ndarray,
+    step: int | None = None,
+    tag: str = "Recon 3x7",
+    output_dir: str = ".",
+):
+    """
+    Logs a single 3×7 grid for:
+      [T1 input, T1 recon, T2 recon, T2 true, T2 pred, (T2pred - T1recon), (T2pred - T2recon)]
+    across [axial, coronal, sagittal] views, with colorbar scales for the two diff columns.
+    """
+
+    # Drop channel dim -> [D,H,W]
+    t1 = t1_vol_np[0]
+    r1 = t1_recon_np[0]
+    r2 = t2_recon_np[0]
+    t2 = t2_true_np[0]
+    p2 = t2_pred_np[0]
+
+    D, H, W = t1.shape
+    iz, iy, ix = D // 2, H // 2, W // 2
+
+    # Difference maps (signed)
+    d_p2_r1 = p2 - r1
+    d_p2_r2 = p2 - r2
+
+    # Robust symmetric limits for difference visualization
+    def _robust_sym_lim(x: np.ndarray, q: float = 99.0, eps: float = 1e-8) -> float:
+        v = float(np.percentile(np.abs(x), q))
+        return max(v, eps)
+
+    lim_r1 = _robust_sym_lim(d_p2_r1)
+    lim_r2 = _robust_sym_lim(d_p2_r2)
+
+    # Prepare images in row-major order (3 rows × 7 cols = 21 panels)
+    images = [
+        # Axial (axis=0)
+        t1[iz, :, :], r1[iz, :, :], r2[iz, :, :], t2[iz, :, :], p2[iz, :, :], d_p2_r1[iz, :, :], d_p2_r2[iz, :, :],
+        # Coronal (axis=1)
+        t1[:, iy, :], r1[:, iy, :], r2[:, iy, :], t2[:, iy, :], p2[:, iy, :], d_p2_r1[:, iy, :], d_p2_r2[:, iy, :],
+        # Sagittal (axis=2)
+        t1[:, :, ix], r1[:, :, ix], r2[:, :, ix], t2[:, :, ix], p2[:, :, ix], d_p2_r1[:, :, ix], d_p2_r2[:, :, ix],
+    ]
+
+    sa = meta.get("start_age", None)
+    fa = meta.get("followup_age", None)
+    sid = meta.get("subject_id", "")
+    uid = meta.get("image_uid", "")
+
+    top_title = f"{sid}  |  ΔAge={(fa - sa):.2f} mo" if sa is not None and fa is not None else sid
+    if uid:
+        top_title += f"  |  UID={uid}"
+
+    cols = ["T₁ Input", "T₁ Recon", "T₂ Recon", "T₂ True", "T₂ Pred", "T₂Pred − T₁Recon", "T₂Pred − T₂Recon"]
+    rows = ["Axial", "Coronal", "Sagittal"]
+
+    titles = []
+    for view in rows:
+        for col in cols:
+            if view == "Axial" and col == "T₁ Input" and sa is not None:
+                titles.append(f"{col}\n(age={sa:.2f})")
+            elif view == "Axial" and col == "T₂ True" and fa is not None:
+                titles.append(f"{col}\n(age={fa:.2f})")
+            else:
+                titles.append(col)
+
+    # Plot 3×7
+    fig, axes = plt.subplots(3, 7, figsize=(24, 12))
+    axes2d = axes  # keep 2D for easy indexing
+    axes = axes.flatten()
+
+    im_diff_r1 = None
+    im_diff_r2 = None
+
+    for i, (ax, img, ttl) in enumerate(zip(axes, images, titles)):
+        col_idx = i % 7
+        is_diff_col = col_idx in (5, 6)
+
+        if is_diff_col:
+            lim = lim_r1 if col_idx == 5 else lim_r2
+            im = ax.imshow(np.rot90(img), cmap="seismic", vmin=-lim, vmax=lim)
+            if col_idx == 5 and im_diff_r1 is None:
+                im_diff_r1 = im
+            if col_idx == 6 and im_diff_r2 is None:
+                im_diff_r2 = im
+        else:
+            ax.imshow(np.rot90(img), cmap="gray", vmin=0, vmax=1)
+
+        ax.set_title(ttl, fontsize=10)
+        ax.axis("off")
+
+    # Add colorbars for diff columns (one per column, spanning all 3 rows)
+    # Place them just to the right of the respective diff column.
+    if im_diff_r1 is not None:
+        cbar1 = fig.colorbar(
+            im_diff_r1,
+            ax=axes2d[:, 5],
+            fraction=0.025,
+            pad=0.02,
+        )
+        cbar1.set_label("Δ intensity", rotation=90)
+        # Optionally show symmetric ticks
+        cbar1.set_ticks([-lim_r1, 0.0, lim_r1])
+
+    if im_diff_r2 is not None:
+        cbar2 = fig.colorbar(
+            im_diff_r2,
+            ax=axes2d[:, 6],
+            fraction=0.025,
+            pad=0.02,
+        )
+        cbar2.set_label("Δ intensity", rotation=90)
+        cbar2.set_ticks([-lim_r2, 0.0, lim_r2])
+
+    fig.suptitle(top_title, fontsize=14)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # Save, log, remove
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    tmp = outdir / f"tmp_{sid}_{uid}_3x7.png"
+
+    plt.savefig(tmp, dpi=120)
+    plt.close(fig)
+
+    payload = {tag: wandb.Image(str(tmp))}
+    if step is not None:
+        payload["opt_step"] = step
+    wandb.log(payload)
+
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
 
 def log_recon_comparison_to_wandb(
     meta: dict,
@@ -496,7 +636,8 @@ class AgeResidualLatentDecoder(nn.Module):
             nn.Conv3d(hidden, self.latent_channels, 3, padding=1),
         )
         # make delta initially zero
-        nn.init.zeros_(self.cond_net[-1].weight)
+        # nn.init.zeros_(self.cond_net[-1].weight)
+        nn.init.normal_(self.cond_net[-1].weight, mean=0.0, std=1e-5)
         nn.init.zeros_(self.cond_net[-1].bias)
 
         # learnable scale; alpha=0 => tanh(alpha)=0 => identity
@@ -715,13 +856,14 @@ def _is_better(curr, best, delta_abs=0.0, delta_rel=None):
         return curr < best * (1.0 - float(delta_rel))  # relative improvement
     return curr < (best - float(delta_abs))            # absolute improvement
 
-def _save_ckpt(path, cond_decoder, discriminator, extra=None):
+def _save_ckpt(path, cond_decoder, discriminator=None, extra=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     state = {
         "cond_decoder": cond_decoder.state_dict(),
-        "discriminator": discriminator.state_dict(),
         "extra": extra or {}
     }
+    if discriminator is not None:
+        state["discriminator"] = discriminator.state_dict()
     torch.save(state, path)
 
 # @torch.no_grad()
@@ -852,7 +994,12 @@ def evaluate_one_epoch(
     autoencoder=None,
     discriminator=None,
     adv_loss_fn=None,
-    adv_weight: float = 0.0,):
+    adv_weight: float = 0.0,
+    identity_weight: float = 0.0,
+    delta_weight: float = 0.0,
+    ssim_metric=None,                 # expects (pred, target)->tensor [B] or scalar
+    age_axis=None, dt_axis=None, Wgrid=None,  # for bilinear_lookup_weight
+    jac_abs_thresh: float = 0.0,      ):
 
     model.eval()
     if discriminator is not None:
@@ -876,6 +1023,8 @@ def evaluate_one_epoch(
         "ssim_t1_t2": 0.0,
         "ssim_pred_t1recon": 0.0,
         "ssim_t1recon_t2": 0.0,
+        "idt": 0.0,
+        "delta": 0.0,
     }
 
     for batch in loader:
@@ -890,7 +1039,40 @@ def evaluate_one_epoch(
             x1_pred = model(img0, age0, age1)
 
             rec_loss  = l1_loss_fn(x1_pred.float(), img1.float())
-            perc_loss = perceptual_weight * perc_loss_fn(x1_pred.float(), img1.float())
+            perc_loss = perc_loss_fn(x1_pred.float(), img1.float())
+
+            # identity path
+            x0_id = model(img0, age0, age0)
+            identity_loss = torch.tensor(0.0, device=device)
+
+            # ---- delta loss (same as train) ----
+            delta_loss = torch.tensor(0.0, device=device)
+
+            need_recon0 = (
+                (delta_weight > 0)
+                or (identity_weight > 0)  # only if you want identity vs recon0
+            )
+
+            recon0 = None
+            if need_recon0 and autoencoder is not None:
+                recon0 = autoencoder.reconstruct(img0)
+
+            # identity
+            if identity_weight > 0:
+                if recon0 is not None:
+                    identity_loss = l1_loss_fn(x0_id.float(), recon0.float())  # stable manifold target
+                else:
+                    print('No recon0 calculated')
+                    # identity_loss = l1_loss_fn(x0_id.float(), img0.float())
+
+            # delta
+            if (delta_weight > 0) and (recon0 is not None) and (ssim_metric is not None) \
+            and (age_axis is not None) and (dt_axis is not None) and (Wgrid is not None):
+                ssim_per = ssim_metric(x1_pred.float(), recon0.float()).view(-1)
+                dt = (age1 - age0).abs().view(-1)
+                a0 = age0.view(-1)
+                w = bilinear_lookup_weight(a0, dt, age_axis, dt_axis, Wgrid).clamp(0.0, 1.0)
+                delta_loss = (w * ssim_per).mean()
 
             gen_adv_loss = torch.tensor(0.0, device=device)
             loss_d = torch.tensor(0.0, device=device)
@@ -912,7 +1094,13 @@ def evaluate_one_epoch(
                 )
                 loss_d = adv_weight * 0.5 * (d_loss_fake + d_loss_real)
 
-            loss_g = rec_loss + perc_loss + gen_adv_loss
+            loss_g = (
+                rec_loss
+                + (perceptual_weight * perc_loss)
+                + gen_adv_loss
+                + (identity_weight * identity_loss)
+                + (delta_weight * delta_loss)
+            )
 
             # ---- SSIMs ----
             ssim_pred_t2 = batch_ssim_scalar(x1_pred.float(), img1.float(), data_range=1.0)
@@ -934,6 +1122,8 @@ def evaluate_one_epoch(
         sums["perc"]  += bsz * float(perc_loss.item())
         sums["adv"]   += bsz * float(gen_adv_loss.item())
         sums["total"] += bsz * float(loss_g.item())
+        sums["idt"]   += bsz * float(identity_loss.item())
+        sums["delta"] += bsz * float(delta_loss.item())
         sums["d"]     += bsz * float(loss_d.item())
 
         sums["ssim_pred_t2"] += bsz * float(ssim_pred_t2.item())
@@ -945,6 +1135,109 @@ def evaluate_one_epoch(
             sums["ssim_t1recon_t2"] += bsz * float(ssim_t1recon_t2.item())
 
     return {k: v / max(n, 1) for k, v in sums.items()}
+# def evaluate_one_epoch(
+#     model,
+#     loader,
+#     device,
+#     l1_loss_fn,
+#     perc_loss_fn,
+#     perceptual_weight: float,
+#     autoencoder=None,
+#     discriminator=None,
+#     adv_loss_fn=None,
+#     adv_weight: float = 0.0,):
+
+#     model.eval()
+#     if discriminator is not None:
+#         discriminator.eval()
+#     if autoencoder is not None:
+#         autoencoder.eval()
+
+#     use_adv = (discriminator is not None) and (adv_loss_fn is not None) and (adv_weight > 0)
+
+#     n = 0
+#     sums = {
+#         "rec": 0.0,
+#         "perc": 0.0,
+#         "total": 0.0,
+
+#         # keep keys for wandb consistency
+#         "adv": 0.0,
+#         "d": 0.0,
+
+#         "ssim_pred_t2": 0.0,
+#         "ssim_t1_t2": 0.0,
+#         "ssim_pred_t1recon": 0.0,
+#         "ssim_t1recon_t2": 0.0,
+#     }
+
+#     for batch in loader:
+#         img0, age0, img1, age1, subject_id = batch
+#         img0 = img0.to(device)
+#         img1 = img1.to(device)
+#         age0 = age0.to(device).float()
+#         age1 = age1.to(device).float()
+
+#         # autocast only helps on cuda
+#         with autocast(enabled=True):
+#             x1_pred = model(img0, age0, age1)
+
+#             rec_loss  = l1_loss_fn(x1_pred.float(), img1.float())
+#             perc_loss = perceptual_weight * perc_loss_fn(x1_pred.float(), img1.float())
+
+#             gen_adv_loss = torch.tensor(0.0, device=device)
+#             loss_d = torch.tensor(0.0, device=device)
+
+#             if use_adv:
+#                 logits_fake = discriminator(x1_pred.contiguous().float())[-1]
+#                 gen_adv_loss = adv_weight * adv_loss_fn(
+#                     logits_fake, target_is_real=True, for_discriminator=False
+#                 )
+
+#                 # discriminator eval loss
+#                 logits_fake_detach = discriminator(x1_pred.contiguous().detach())[-1]
+#                 d_loss_fake = adv_loss_fn(
+#                     logits_fake_detach, target_is_real=False, for_discriminator=True
+#                 )
+#                 logits_real = discriminator(img1.contiguous().detach())[-1]
+#                 d_loss_real = adv_loss_fn(
+#                     logits_real, target_is_real=True, for_discriminator=True
+#                 )
+#                 loss_d = adv_weight * 0.5 * (d_loss_fake + d_loss_real)
+
+#             loss_g = rec_loss + perc_loss + gen_adv_loss
+
+#             # ---- SSIMs ----
+#             ssim_pred_t2 = batch_ssim_scalar(x1_pred.float(), img1.float(), data_range=1.0)
+#             ssim_t1_t2   = batch_ssim_scalar(img0.float(),   img1.float(), data_range=1.0)
+
+#             if autoencoder is not None:
+#                 # IMPORTANT: this can be expensive / memory-heavy if done on big batches
+#                 t1_recon = autoencoder.reconstruct(img0)
+#                 ssim_pred_t1recon = batch_ssim_scalar(x1_pred.float(), t1_recon.float(), data_range=1.0)
+#                 ssim_t1recon_t2   = batch_ssim_scalar(img1.float(),    t1_recon.float(), data_range=1.0)
+#             else:
+#                 ssim_pred_t1recon = torch.tensor(float("nan"), device=device)
+#                 ssim_t1recon_t2   = torch.tensor(float("nan"), device=device)
+
+#         bsz = img0.size(0)
+#         n += bsz
+
+#         sums["rec"]   += bsz * float(rec_loss.item())
+#         sums["perc"]  += bsz * float(perc_loss.item())
+#         sums["adv"]   += bsz * float(gen_adv_loss.item())
+#         sums["total"] += bsz * float(loss_g.item())
+#         sums["d"]     += bsz * float(loss_d.item())
+
+#         sums["ssim_pred_t2"] += bsz * float(ssim_pred_t2.item())
+#         sums["ssim_t1_t2"]   += bsz * float(ssim_t1_t2.item())
+
+#         if np.isfinite(float(ssim_pred_t1recon.item())):
+#             sums["ssim_pred_t1recon"] += bsz * float(ssim_pred_t1recon.item())
+#         if np.isfinite(float(ssim_t1recon_t2.item())):
+#             sums["ssim_t1recon_t2"] += bsz * float(ssim_t1recon_t2.item())
+
+#     return {k: v / max(n, 1) for k, v in sums.items()}
 
 def count_trainable(m):
     n = sum(p.numel() for p in m.parameters() if p.requires_grad)
@@ -1006,6 +1299,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size',     default=16,    type=int)
     parser.add_argument('--lr',             default=1e-4,  type=float)
     parser.add_argument('--adv_weight',         default=0.025, type=float)
+    parser.add_argument('--reconstruction_weight',         default=1, type=float)
     parser.add_argument('--perceptual_weight',  default=0.001, type=float)
     parser.add_argument('--discriminative_lr',  default=0.1, type=float,
                         help="How much to adapt old layers versus new ones for fine-tuning (At 0.1; old layers do adapt, but at a slower pace than new ones)")
@@ -1019,7 +1313,7 @@ if __name__ == '__main__':
                         help="Which current training fold (1-5)")
     parser.add_argument('--age_min_m',      default=12.0,  type=float,
                         help="Minimal age in months for training data")
-    parser.add_argument('--age_max_m',      default=12.0,  type=float,
+    parser.add_argument('--age_max_m',      default=84.0,  type=float,
                         help="Maximal age in months for training data")
     # New arguments for final run
     parser.add_argument('--early_stop_patience', type=int, default=50,
@@ -1057,7 +1351,7 @@ if __name__ == '__main__':
     # Initialize WandB
     wandb.init(
         project=args.project,
-        name=f"{run_name}_fold{fold}_convNet_deltaloss_noadvweight",
+        name=f"{run_name}_fold{fold}_convNet_deltaloss_identityloss_noadvweight",
         mode="online",
         config=vars(args)
     )
@@ -1065,6 +1359,18 @@ if __name__ == '__main__':
 
     # wandb.run.define_metric("train/*", step_metric="total_counter")
     # wandb.run.define_metric("val/*",   step_metric="epoch")
+    # Tell W&B what fields represent steps
+    wandb.define_metric("opt_step")
+    wandb.define_metric("epoch")
+
+    # Train metrics should use optimizer-step as x-axis
+    wandb.define_metric("train/*", step_metric="opt_step")
+
+    # Val metrics should use epoch as x-axis
+    wandb.define_metric("val/*", step_metric="epoch")
+
+    # (optional) any status/debug also by epoch
+    wandb.define_metric("status/*", step_metric="epoch")
 
     # ─── Load RBF surface for delta_loss ───────────────────────────
     age_axis, dt_axis, Wgrid = load_rbf_lookup(args.rbf_npz_path, DEVICE)
@@ -1158,6 +1464,8 @@ if __name__ == '__main__':
 
     model = FullPredictor(autoencoder, cond_decoder).to(DEVICE)
 
+    print("same cond_decoder object:", model.cond_decoder is cond_decoder)  # adjust attribute if needed
+
     # ─── Losses & Optimizers ─────────────────────────────────────
     l1_loss_fn = L1Loss().to(DEVICE)
 
@@ -1192,6 +1500,9 @@ if __name__ == '__main__':
         ],
         weight_decay=1e-5
     )
+    alpha = model.cond_decoder.alpha
+    in_opt = any(p is alpha for g in optimizer_g.param_groups for p in g["params"])
+    print("[debug] alpha requires_grad:", alpha.requires_grad, "| alpha in optimizer:", in_opt)
     if args.adv_weight > 0:
         optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=config.lr)
         gradacc_d = GradientAccumulation(
@@ -1219,7 +1530,7 @@ if __name__ == '__main__':
     epochs_no_improve = 0
     
     LOG_METRICS_EVERY_UPDATES = 25
-    LOG_IMAGES_EVERY_UPDATES  = 2000
+    LOG_IMAGES_EVERY_UPDATES  = 200
 
     steps_until_update = gradacc_g.steps_until_update  # effective_accum_steps
     steps_until_update = gradacc_g.steps_until_update
@@ -1269,40 +1580,61 @@ if __name__ == '__main__':
 
             # ── Generator (“conditional decoder”) step ─────────────
             # baseline "no-change" prediction (no grad)
-            with torch.no_grad():
-                with autocast(enabled=True):
-                    x0_id = model(img0, age0, age0)  # [B,1,D,H,W]
+            # with torch.no_grad():
+            #     with autocast(enabled=True):
+            #         x0_id = model(img0, age0, age0)  # [B,1,D,H,W]
 
             with autocast(enabled=True):
                 x1_pred = model(img0, age0, age1)  # [B,1,D,H,W]
-
-                # identity loss: make baseline no-change prediction match baseline image
-                identity_loss = l1_loss_fn(x0_id.float(), img0.float())
+                x0_id = model(img0, age0, age0)
 
                 # AE reconstruction baseline (frozen AE)
                 with torch.no_grad():
                     recon0 = autoencoder.reconstruct(img0)  # [B,1,D,H,W]  (adapt name if needed)
 
+                # identity loss: make baseline no-change prediction match baseline image
+                identity_loss = l1_loss_fn(x0_id.float(), recon0.float())
+
                 # per-sample SSIM between predicted follow-up and baseline recon
                 # (minimize SSIM -> encourage change away from baseline)
-                ssim_per = ssim_metric(x1_pred.float(), recon0.float()).view(-1)  # tensor [B]
+                # ssim_per = ssim_metric(x1_pred.float(), recon0.float()).view(-1)  # tensor [B]
 
-                # age0, dt in months (already [0,1])
+                # # age0, dt in months (already [0,1])
+                # dt = (age1 - age0).abs().view(-1)
+                # a0 = age0.view(-1)
+
+                # # RBF weight F(age0, dt) in [0,1] with F(0,0)=1
+                # w = bilinear_lookup_weight(a0, dt, age_axis, dt_axis, Wgrid)  # [B]
+                # w = w.clamp(0.0, 1.0)  # safety
+
+                # if step % 200 == 0:
+                #     print("age_axis range:", float(age_axis[0]), float(age_axis[-1]))
+                #     print("dt_axis range :", float(dt_axis[0]), float(dt_axis[-1]))
+                #     print("Wgrid min/max :", float(Wgrid.min()), float(Wgrid.max()))
+                #     print("w min/mean/max:", float(w.min()), float(w.mean()), float(w.max()))
+
+                # delta_loss = (w * ssim_per).mean()
+
+                # (OR maximize (1-SSIM)^0.5)
+                ssim_per = ssim_metric(x1_pred.float(), recon0.float()).view(-1)
+                ssim_per = ssim_per.clamp(0.0, 1.0)
+
+                d = (1.0 - ssim_per).clamp_min(0.0)          # [B]
+                delta_gain_per = torch.sqrt(d + 1e-8)        # sqrt(1-SSIM), [B]
+
+                # RBF weight in [0,1]
                 dt = (age1 - age0).abs().view(-1)
                 a0 = age0.view(-1)
-
-                # RBF weight F(age0, dt) in [0,1] with F(0,0)=1
-                w = bilinear_lookup_weight(a0, dt, age_axis, dt_axis, Wgrid)  # [B]
-                w = w.clamp(0.0, 1.0)  # safety
+                w = bilinear_lookup_weight(a0, dt, age_axis, dt_axis, Wgrid).clamp(0.0, 1.0)
 
                 if step % 200 == 0:
                     print("age_axis range:", float(age_axis[0]), float(age_axis[-1]))
                     print("dt_axis range :", float(dt_axis[0]), float(dt_axis[-1]))
                     print("Wgrid min/max :", float(Wgrid.min()), float(Wgrid.max()))
                     print("w min/mean/max:", float(w.min()), float(w.mean()), float(w.max()))
+                    print("delta_gain_per, min/mean/max:", float(delta_gain_per.min()), float(delta_gain_per.mean()), float(delta_gain_per.max()))
 
-                delta_loss = (w * ssim_per).mean()
-                
+                delta_loss = (w * delta_gain_per).mean()
 
                 if args.adv_weight > 0:
                     # Discriminator on fake → generator adv‐loss
@@ -1318,9 +1650,12 @@ if __name__ == '__main__':
                 rec_loss = l1_loss_fn(x1_pred.float(), img1.float())
 
                 # Optional perceptual loss
-                perc_loss = args.perceptual_weight * perc_loss_fn(x1_pred.float(), img1.float())
+                perc_loss = perc_loss_fn(x1_pred.float(), img1.float())
 
-                loss_g = rec_loss + gen_adv_loss + perc_loss + args.delta_weight * delta_loss + args.identity_weight * identity_loss
+                #If SSIM
+                # loss_g = args.reconstruction_weight * rec_loss + gen_adv_loss + args.perceptual_weight * perc_loss + args.delta_weight * delta_loss + args.identity_weight * identity_loss
+                # If 1-SSIM
+                loss_g = args.reconstruction_weight * rec_loss + gen_adv_loss + args.perceptual_weight * perc_loss - args.delta_weight * delta_loss + args.identity_weight * identity_loss
 
                 if step == 0 and epoch == 0:
                     print("x1_pred:", tuple(x1_pred.shape))
@@ -1352,6 +1687,10 @@ if __name__ == '__main__':
             avgloss.put('Generator/identity_loss', identity_loss.item())
             avgloss.put('Generator/delta_loss', delta_loss.item())
             avgloss.put('Generator/total',      loss_g.item())
+            avgloss.put("Generator/perc_contrib", (args.perceptual_weight * perc_loss).item())
+            avgloss.put('Generator/rec_contrib', (args.reconstruction_weight * rec_loss).item())
+            avgloss.put("Generator/identity_contrib", (args.identity_weight * identity_loss).item())
+            avgloss.put("Generator/delta_contrib", (args.delta_weight * delta_loss).item())
             if args.adv_weight > 0:
                 avgloss.put('Generator/adv_loss', gen_adv_loss.item())
                 avgloss.put('Discriminator/loss', loss_d.item())
@@ -1373,9 +1712,24 @@ if __name__ == '__main__':
                 total_counter += 1
 
                 # log alpha at update cadence
-                if total_counter % LOG_METRICS_EVERY_UPDATES == 0:
-                    alpha_eff = float(torch.tanh(model.cond_decoder.alpha).detach().cpu().item())
-                    wandb.log({"train/alpha_tanh": alpha_eff}, step=total_counter)
+                # if total_counter % LOG_METRICS_EVERY_UPDATES == 0:
+                #     a = model.cond_decoder.alpha  # safest: same object used in optimizer
+                #     a_raw  = float(a.detach().cpu())
+                #     a_tanh = float(torch.tanh(a).detach().cpu())
+                #     a_grad = 0.0 if (a.grad is None) else float(a.grad.detach().abs().mean().cpu())
+
+                #     # optional: check once in a while that alpha is in optimizer
+                #     a_id = id(a)
+                #     in_opt = any(id(p) == a_id for g in optimizer_g.param_groups for p in g["params"])
+
+                #     wandb.log({
+                #         "train/alpha_raw": a_raw,
+                #         "train/alpha_tanh": a_tanh,
+                #         "train/alpha_grad_absmean": a_grad,
+                #         "train/alpha_in_optimizer": int(in_opt),
+                #     }, step=total_counter)
+                    # alpha_eff = float(torch.tanh(model.cond_decoder.alpha).detach().cpu().item())
+                    # wandb.log({"train/alpha_tanh": alpha_eff}, step=total_counter)
 
                 # scalar metrics every 25 optimizer updates
                 if total_counter % LOG_METRICS_EVERY_UPDATES == 0:
@@ -1385,15 +1739,24 @@ if __name__ == '__main__':
                         "train/gen/identity_loss": avgloss.pop_avg("Generator/identity_loss"),
                         "train/gen/delta_loss":    avgloss.pop_avg("Generator/delta_loss"),
                         "train/gen/total":         avgloss.pop_avg("Generator/total"),
+                        "train/gen/perc_contrib":     avgloss.pop_avg("Generator/perc_contrib"),
+                        "train/gen/rec_contrib":     avgloss.pop_avg("Generator/rec_contrib"),
+                        "train/gen/identity_contrib": avgloss.pop_avg("Generator/identity_contrib"),
+                        "train/gen/delta_contrib":    avgloss.pop_avg("Generator/delta_contrib"),
                         "epoch": epoch,
                         "micro_step": micro_counter,
                         "opt_step": total_counter,
                     }
+                    total = metrics["train/gen/total"]
+                    metrics["train/gen/delta_over_rec"] = metrics["train/gen/delta_contrib"] / (total + 1e-8)
+                    metrics["train/gen/idt_over_rec"]   = metrics["train/gen/identity_contrib"] / (total + 1e-8)
+                    metrics["train/gen/perc_over_rec"]  = metrics["train/gen/perc_contrib"] / (total + 1e-8)
+                    metrics["train/gen/rec_over_rec"]  = metrics["train/gen/rec_contrib"] / (total + 1e-8)
                     if args.adv_weight > 0:
                         metrics["train/gen/adv_loss"] = avgloss.pop_avg("Generator/adv_loss")
                         metrics["train/disc/loss"]    = avgloss.pop_avg("Discriminator/loss")
 
-                    wandb.log(metrics, step=total_counter)
+                    wandb.log(metrics)
 
                 # images every 50 optimizer updates
                 if total_counter % LOG_IMAGES_EVERY_UPDATES == 0:
@@ -1404,7 +1767,9 @@ if __name__ == '__main__':
 
                     with torch.no_grad():
                         recon0_vis = autoencoder.reconstruct(img0[:1])  # [1,1,D,H,W]
-                    recon_vol = recon0_vis[0, 0].detach().cpu().numpy()[None, ...]
+                        recon1_vis = autoencoder.reconstruct(img1[:1])  # [1,1,D,H,W]
+                    recon0_vol = recon0_vis[0, 0].detach().cpu().numpy()[None, ...]
+                    recon1_vol = recon1_vis[0, 0].detach().cpu().numpy()[None, ...]
 
                     # convert normalized ages back to months (if your dataset is normalized)
                     age0_months = age0[0].item() * (args.age_max_m - args.age_min_m) + args.age_min_m
@@ -1416,10 +1781,20 @@ if __name__ == '__main__':
                         "followup_age": age1_months,
                     }
 
-                    log_recon_3x4_to_wandb(
+                    # log_recon_3x4_to_wandb(
+                    #     meta,
+                    #     baseline_vol,
+                    #     recon0_vol,
+                    #     true_vol,
+                    #     pred_vol,
+                    #     step=total_counter,
+                    #     tag="Train/Recon_Pred"
+                    # )
+                    log_recon_3x7_to_wandb(
                         meta,
                         baseline_vol,
-                        recon_vol,
+                        recon0_vol,
+                        recon1_vol,
                         true_vol,
                         pred_vol,
                         step=total_counter,
@@ -1494,32 +1869,31 @@ if __name__ == '__main__':
         
         print(f"Epoch {epoch} ▶︎ Train L1 = {avgloss.get_avg('Generator/rec_loss'):.4f}")
 
-        if args.adv_weight > 0:
-            val_means = evaluate_one_epoch(
-                        model, discriminator, valid_loader, DEVICE,
-                        l1_loss_fn, perc_loss_fn, adv_loss_fn,
-                        adv_weight=args.adv_weight, perceptual_weight=args.perceptual_weight,
-                        autoencoder=autoencoder
-                    )
-        else:
-            val_means = evaluate_one_epoch(
-                                            model=model,
-                                            loader=valid_loader,
-                                            device=DEVICE,
-                                            l1_loss_fn=l1_loss_fn,
-                                            perc_loss_fn=perc_loss_fn,
-                                            perceptual_weight=args.perceptual_weight,
-                                            autoencoder=autoencoder,          # optional (can be None)
-                                            discriminator=None,
-                                            adv_loss_fn=None,
-                                            adv_weight=0.0,
-                                        )
+        val_means = evaluate_one_epoch(
+            model=model,
+            loader=valid_loader,
+            device=DEVICE,
+            l1_loss_fn=l1_loss_fn,
+            perc_loss_fn=perc_loss_fn,
+            perceptual_weight=args.perceptual_weight,
+            autoencoder=autoencoder,
+            discriminator=(discriminator if args.adv_weight > 0 else None),
+            adv_loss_fn=(adv_loss_fn if args.adv_weight > 0 else None),
+            adv_weight=args.adv_weight,
+
+            identity_weight=args.identity_weight,
+            delta_weight=args.delta_weight,
+            ssim_metric=ssim_metric,          # your per-sample metric used in train
+            age_axis=age_axis,
+            dt_axis=dt_axis,
+            Wgrid=Wgrid,
+        )
 
         if epoch % 50 == 0:
             wb_log_val_ssim_map(model, valid_loader, DEVICE, epoch)
 
-        alpha_eff = float(torch.tanh(model.cond_decoder.alpha).detach().cpu().item())
-        wandb.log({"val/alpha_tanh": alpha_eff, "epoch": epoch})
+        # alpha_eff = float(torch.tanh(model.cond_decoder.alpha).detach().cpu().item())
+        # wandb.log({"val/alpha_tanh": alpha_eff, "epoch": epoch})
 
         val_total = float(val_means["total"])
         val_rec   = float(val_means["rec"])
@@ -1528,6 +1902,8 @@ if __name__ == '__main__':
             # "val/loss/adv": val_means["adv"],
             # "val/loss/disc": val_means["d"],
             "val/loss/perc": val_means["perc"],
+            "val/loss/idt":   val_means["idt"],
+            "val/loss/delta": val_means["delta"],
             "val/loss/total": val_means["total"],
             
 
@@ -1556,29 +1932,41 @@ if __name__ == '__main__':
 
             # Best checkpoint logic (only after min_epochs)
             if _is_better(val_total, best_val, delta_abs=args.early_stop_delta):
+                prev_best = best_val
                 best_val = val_total
                 best_epoch = int(epoch)
                 epochs_no_improve = 0
                 _save_ckpt(best_ckpt_path, cond_decoder, discriminator,
                         extra={"epoch": best_epoch, "val_total": best_val})
+
+                if prev_best is None:
+                    print(f"[best] Epoch {epoch} set initial best val_total = {best_val:.6f}. Saved: {best_ckpt_path}")
+                else:
+                    print(f"[best] Epoch {epoch} improved val_total {prev_best:.6f} → {best_val:.6f}. Saved: {best_ckpt_path}")
+
                 wandb.log({"status/new_best": 1,
                         "status/best_epoch": best_epoch,
-                        "status/best_val_total": best_val}, step=epoch)
+                        "status/best_val_total": best_val, "epoch": epoch})
             else:
                 epochs_no_improve += 1
-                wandb.log({"status/new_best": 0,
-                        "status/epochs_no_improve": epochs_no_improve}, step=epoch)
+                wandb.log({
+                    "epoch": epoch,
+                    "status/new_best": 0,
+                    "status/epochs_no_improve": epochs_no_improve,
+                    "status/best_epoch": best_epoch,
+                    "status/best_val_total": best_val if best_val is not None else float("nan"),
+                })
 
             # Early stopping (unchanged but now consistent)
             if epochs_no_improve >= args.early_stop_patience:
-                print(f"[early-stop] No improvement for {epochs_no_improve} epochs "
-                    f"(best={best_val:.6f} @ epoch {best_epoch}). Stopping.")
+                best_str = "None" if best_val is None else f"{best_val:.6f}"
+                print(f"[early-stop] No improvement for {epochs_no_improve} epochs (best={best_str} @ epoch {best_epoch}). Stopping.")
                 break
         else:
             # during warmup: do not update best/patience
             epochs_no_improve = 0
             wandb.log({"status/monitor_warmup": 1,
-                    "status/warmup_until_epoch": args.min_epochs}, step=epoch)
+                    "status/warmup_until_epoch": args.min_epochs, "epoch": epoch})
 
         # _save_ckpt(
         # last_ckpt_path, cond_decoder, discriminator,

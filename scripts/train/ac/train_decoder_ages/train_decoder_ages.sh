@@ -4,7 +4,7 @@
 #SBATCH --gpus=h100:1                 # Full H100-80GB GPU
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=25G
-#SBATCH --time=00-06:00
+#SBATCH --time=00-60:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --account=def-bedelb
@@ -32,7 +32,7 @@ echo "[info] fold=$FOLD uses ckpt=$AEKL_CKPT"
 
 # Base dirs
 BASE=$HOME/scratch/bgp
-OUT_ROOT=ae_decoder_ages_output
+OUT_ROOT=ae_decoder_ages_output_NEWEST
 OUT_DIR=${BASE}/${OUT_ROOT}/fold_${FOLD}
 mkdir -p "$OUT_DIR"
 
@@ -41,7 +41,7 @@ python /home/andim/BrainGrowthPrediction/scripts/train/train_decoder_ages.py \
   --n_epochs      400 \
   --max_batch_size 3 \
   --batch_size    27 \
-  --min_epochs 100 \
+  --min_epochs 50 \
   --adv_weight 0 \
   --early_stop_patience 100 \
   --early_stop_delta 0.00015 \
@@ -50,9 +50,10 @@ python /home/andim/BrainGrowthPrediction/scripts/train/train_decoder_ages.py \
   --plateau_patience 12 \
   --plateau_cooldown 6 \
   --plateau_max_reductions 3 \
-  --delta_weight 0.5 \
+  --delta_weight 0.6 \
   --identity_weight 0.5 \
-  --rbf_npz_path /home/andim/projects/def-bedelb/andim/bgp/rbf_surface_ssim_recon_foldALL.npz \
+  --perceptual_weight 0.01 \
+  --rbf_npz_path /home/andim/projects/def-bedelb/andim/bgp/rbf_surface_1-ssim_recon_foldALL.npz \
   --aekl_ckpt     "$AEKL_CKPT" \
   --output_dir    "$OUT_DIR" \
   --fold          "$FOLD" 
