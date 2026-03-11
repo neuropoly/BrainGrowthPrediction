@@ -6,6 +6,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import json
+from pathlib import Path
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from tqdm import tqdm
@@ -259,9 +260,7 @@ def log_recon_3x7_to_wandb(
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
     # Save, log, remove
-    outdir = Path(output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    tmp = outdir / f"tmp_{sid}_{uid}_3x7.png"
+    tmp = f"{output_dir}/tmp_{sid}_{uid}_3x7.png"
 
     plt.savefig(tmp, dpi=120)
     plt.close(fig)
@@ -1791,13 +1790,14 @@ if __name__ == '__main__':
                     #     tag="Train/Recon_Pred"
                     # )
                     log_recon_3x7_to_wandb(
-                        meta,
-                        baseline_vol,
-                        recon0_vol,
-                        recon1_vol,
-                        true_vol,
-                        pred_vol,
+                        meta=meta,
+                        t1_vol_np=baseline_vol,
+                        t1_recon_np=recon0_vol,
+                        t2_recon_np=recon1_vol,
+                        t2_true_np=true_vol,
+                        t2_pred_np=pred_vol,
                         step=total_counter,
+                        output_dir=args.output_dir,
                         tag="Train/Recon_Pred"
                     )
 

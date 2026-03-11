@@ -5,6 +5,7 @@ scripts/train/ac/*/logs
 scripts/train/ac/*/wandb
 scripts/evaluate/ac/*/logs
 scripts/evaluate/ac/*/wandb
+scripts/analyze/ac/*/logs
 runs
 tmp
 README_PREV.md

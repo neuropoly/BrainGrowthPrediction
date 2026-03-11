@@ -4,7 +4,7 @@
 #SBATCH --gpus=h100:1                       
 #SBATCH --cpus-per-task=12                       # 8 CPU cores
 #SBATCH --mem=25G                               # 25 GB RAM per task
-#SBATCH --time=00-35:00                       # DD-HH:MM:SS
+#SBATCH --time=00-45:00                       # DD-HH:MM:SS
 #SBATCH --account=def-bedelb
 #SBATCH --output=logs/ae_folds_%A_%a.out         # %A = master jobID, %a = array index
 #SBATCH --error=logs/ae_folds_%A_%a.err
@@ -28,8 +28,7 @@ mkdir -p "$OUT_DIR"
 # Run the training script
 python /home/andim/BrainGrowthPrediction/scripts/train/train_autoencoder_folds.py \
   --dataset_csv /home/andim/projects/def-bedelb/andim/brlp-data/datasets_complete_with_cv_splits.csv \
-  --n_epochs 400 \
-  --perceptual_weight 0.25 \
+  --n_epochs 600 \
   --max_batch_size 3 \
   --batch_size 27 \
   --fold "$FOLD" \

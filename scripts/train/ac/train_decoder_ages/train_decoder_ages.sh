@@ -24,7 +24,8 @@ export WANDB_API_KEY=dc2218d115a50f9f76a767712ba52bc7bd448616
 FOLD=$SLURM_ARRAY_TASK_ID
 
 # map folds 1..5 
-AEKL_CKPT="/home/andim/scratch/bgp/ae_folds_output/fold_$SLURM_ARRAY_TASK_ID/autoencoder-best.pth"
+# AEKL_CKPT="/home/andim/scratch/bgp/ae_folds_output/fold_$SLURM_ARRAY_TASK_ID/autoencoder-best.pth"
+AEKL_CKPT="/home/andim/scratch/bgp/ae_folds_output_NEW/fold_$SLURM_ARRAY_TASK_ID/autoencoder-best-loss.pth"
 
 [[ -f "$AEKL_CKPT" ]] || { echo "Checkpoint not found: $AEKL_CKPT"; exit 3; }
 
@@ -32,13 +33,13 @@ echo "[info] fold=$FOLD uses ckpt=$AEKL_CKPT"
 
 # Base dirs
 BASE=$HOME/scratch/bgp
-OUT_ROOT=ae_decoder_ages_output_NEWEST
+OUT_ROOT=ae_decoder_ages_output_new_autoencoder
 OUT_DIR=${BASE}/${OUT_ROOT}/fold_${FOLD}
 mkdir -p "$OUT_DIR"
 
 python /home/andim/BrainGrowthPrediction/scripts/train/train_decoder_ages.py \
   --dataset_csv   $HOME/projects/def-bedelb/andim/brlp-data/datasets_complete_pred_pairs_with_cv_splits.csv \
-  --n_epochs      400 \
+  --n_epochs      500 \
   --max_batch_size 3 \
   --batch_size    27 \
   --min_epochs 50 \
@@ -50,7 +51,7 @@ python /home/andim/BrainGrowthPrediction/scripts/train/train_decoder_ages.py \
   --plateau_patience 12 \
   --plateau_cooldown 6 \
   --plateau_max_reductions 3 \
-  --delta_weight 0.6 \
+  --delta_weight 0.8 \
   --identity_weight 0.5 \
   --perceptual_weight 0.01 \
   --rbf_npz_path /home/andim/projects/def-bedelb/andim/bgp/rbf_surface_1-ssim_recon_foldALL.npz \

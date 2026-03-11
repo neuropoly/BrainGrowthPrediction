@@ -21,7 +21,8 @@ source /home/andim/venvs/bgp/bin/activate
 FOLD=$SLURM_ARRAY_TASK_ID
 
 # AE checkpoint for this fold
-AEKL_CKPT="/home/andim/scratch/bgp/ae_folds_output/fold_${FOLD}/autoencoder-best.pth"
+# AEKL_CKPT="/home/andim/scratch/bgp/ae_folds_output/fold_${FOLD}/autoencoder-best.pth"
+AEKL_CKPT="/home/andim/scratch/bgp/ae_folds_output_NEW/fold_${FOLD}/autoencoder-best-loss.pth"
 [[ -f "$AEKL_CKPT" ]] || { echo "Checkpoint not found: $AEKL_CKPT"; exit 3; }
 
 echo "[info] fold=$FOLD uses ckpt=$AEKL_CKPT"

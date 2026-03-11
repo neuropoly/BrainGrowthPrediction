@@ -133,6 +133,10 @@ def run_validation(autoencoder, discriminator, val_loader, args,
                 # generator-side adversarial term (discriminator fixed)
                 logits_fake_g = discriminator(reconstruction.contiguous().float())[-1]
 
+                # raw KL (unweighted) + weighted KL for total loss
+                kl_raw = kl_loss_fn(z_mu, z_sigma)
+                kld_loss = args.kl_weight * kl_raw
+
                 rec_loss = l1_loss_fn(reconstruction.float(), images.float())
                 kld_loss = args.kl_weight * kl_loss_fn(z_mu, z_sigma)
                 per_loss = args.perceptual_weight * perc_loss_fn(reconstruction.float(), images.float())
@@ -158,6 +162,8 @@ def run_validation(autoencoder, discriminator, val_loader, args,
             sums["Val/Generator/reconstruction_loss"] += rec_loss.item() * bs
             sums["Val/Generator/perceptual_loss"]     += per_loss.item() * bs
             sums["Val/Generator/adversarial_loss"]    += gen_loss.item() * bs
+            sums["Val/Generator/kl_raw"]              += float(kl_raw.item()) * bs
+            sums["Val/Generator/kl_regularization"]   += kld_loss.item() * bs
             sums["Val/Generator/kl_regularization"]   += kld_loss.item() * bs
             sums["Val/Generator/total_loss"]          += val_loss_g.item() * bs
             sums["Val/Discriminator/adversarial_loss"]+= val_loss_d.item() * bs
@@ -182,8 +188,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr',             default=1e-4,  type=float)
     parser.add_argument('--kl_weight',         default=1e-7, type=float)
     parser.add_argument('--adv_weight',         default=0.025, type=float)
-    parser.add_argument('--perceptual_weight',  default=0.001, type=float)
-    parser.add_argument('--aug_p',          default=0.8,   type=float)
+    parser.add_argument('--perceptual_weight',  default=0.001, type=float) 
+    parser.add_argument('--min_kl_raw',  default=3000, type=float)
     parser.add_argument('--fold',      required=True,  type=int,
                         help="Which fold for training")
     parser.add_argument("--log_scalars_every", type=int, default=50)
@@ -272,8 +278,12 @@ if __name__ == '__main__':
 
     avgloss = utils.AverageLoss()
     total_counter = 0
-    best = {"epoch": -1, "score": float("inf"), "ssim": -float("inf")}
+    best_loss = {"epoch": -1, "score": float("inf"), "ssim": -float("inf")}
+    best_ssim = {"epoch": -1, "score": float("inf"), "ssim": -float("inf")}
 
+    # optional: thresholds for “real” improvements (avoid noisy flips)
+    BEST_LOSS_DELTA = getattr(args, "best_loss_delta", 1e-6)   # lower is better
+    BEST_SSIM_DELTA = getattr(args, "best_ssim_delta", 1e-4)   # higher is better
     
     wandb.define_metric("Val/*", step_metric="epoch")
     wandb.define_metric("Train/*", step_metric="total_counter")  # if you log that too
@@ -336,6 +346,7 @@ if __name__ == '__main__':
             avgloss.put('Train/Generator/perceptual_loss',        per_loss.item())
             avgloss.put('Train/Generator/adverarial_loss',        gen_loss.item())
             avgloss.put('Train/Generator/kl_regularization',      kld_loss.item())
+            avgloss.put('Train/Generator/total_loss',             loss_g.item())
             avgloss.put('Train/Discriminator/adverarial_loss',    loss_d.item())
 
             # if total_counter % 50 == 0: #prev each 10 epochs
@@ -366,18 +377,87 @@ if __name__ == '__main__':
 
         score = val_metrics["Val/Generator/total_loss"]   # lower is better
         ssim  = val_metrics["Val/SSIM"]                   # higher is better
+        klraw = val_metrics["Val/Generator/kl_raw"]       # higher (or non-trivially > 0) prevents collapse
 
-        is_better = (score < best["score"]) or (np.isclose(score, best["score"]) and ssim > best["ssim"])
+        eligible = (klraw >= args.min_kl_raw)
 
-        if is_better:
-            best = {"epoch": epoch, "score": score, "ssim": ssim}
-            torch.save(autoencoder.state_dict(),   os.path.join(args.output_dir, "autoencoder-best.pth"))
-            torch.save(discriminator.state_dict(), os.path.join(args.output_dir, "discriminator-best.pth"))
-            wandb.run.summary["best_epoch"] = epoch
-            wandb.run.summary["best_val_total_loss"] = score
-            wandb.run.summary["best_val_ssim"] = ssim
+        # Log eligibility + gate
+        wandb.log(
+            {
+                "Val/eligible_for_best": float(eligible),
+                "Val/min_kl_raw": float(args.min_kl_raw),
+                "epoch": epoch,
+            }
+        )
 
-        print(f"Best epoch: {best['epoch']} | Val total loss: {best['score']:.6g} | Val SSIM: {best['ssim']:.6g}")
+        if not eligible:
+            print(f"[epoch {epoch}] NOT eligible for best (kl_raw={klraw:.6g} < min_kl_raw={args.min_kl_raw:.6g})")
+        else:
+            # -----------------------
+            # Best by TOTAL LOSS
+            # -----------------------
+            if score < best_loss["score"] - BEST_LOSS_DELTA:
+                prev = best_loss.copy()
+                best_loss = {"epoch": epoch, "score": score, "ssim": ssim, "klraw": klraw}
+
+                ae_path = os.path.join(args.output_dir, "autoencoder-best-loss.pth")
+                d_path  = os.path.join(args.output_dir, "discriminator-best-loss.pth")
+                torch.save(autoencoder.state_dict(), ae_path)
+                torch.save(discriminator.state_dict(), d_path)
+
+                wandb.run.summary["best_loss_epoch"] = epoch
+                wandb.run.summary["best_loss_val_total_loss"] = score
+                wandb.run.summary["best_loss_val_ssim"] = ssim
+                wandb.run.summary["best_loss_val_kl_raw"] = klraw
+
+                print(
+                    f"[SAVE best-loss] epoch={epoch} "
+                    f"score={score:.6g} ssim={ssim:.6g} kl_raw={klraw:.6g} "
+                    f"(prev: epoch={prev['epoch']} score={prev['score']:.6g})"
+                )
+
+            # -----------------------
+            # Best by SSIM
+            # -----------------------
+            if ssim > best_ssim["ssim"] + BEST_SSIM_DELTA:
+                prev = best_ssim.copy()
+                best_ssim = {"epoch": epoch, "score": score, "ssim": ssim, "klraw": klraw}
+
+                ae_path = os.path.join(args.output_dir, "autoencoder-best-ssim.pth")
+                d_path  = os.path.join(args.output_dir, "discriminator-best-ssim.pth")
+                torch.save(autoencoder.state_dict(), ae_path)
+                torch.save(discriminator.state_dict(), d_path)
+
+                wandb.run.summary["best_ssim_epoch"] = epoch
+                wandb.run.summary["best_ssim_val_ssim"] = ssim
+                wandb.run.summary["best_ssim_val_total_loss"] = score
+                wandb.run.summary["best_ssim_val_kl_raw"] = klraw
+
+                print(
+                    f"[SAVE best-ssim] epoch={epoch} "
+                    f"ssim={ssim:.6g} score={score:.6g} kl_raw={klraw:.6g} "
+                    f"(prev: epoch={prev['epoch']} ssim={prev['ssim']:.6g})"
+                )
+
+        print(
+            f"[best summary] "
+            f"best-loss: epoch={best_loss['epoch']} score={best_loss['score']:.6g} "
+            f"ssim={best_loss['ssim']:.6g} kl_raw={best_loss['klraw']:.6g} | "
+            f"best-ssim: epoch={best_ssim['epoch']} ssim={best_ssim['ssim']:.6g} "
+            f"score={best_ssim['score']:.6g} kl_raw={best_ssim['klraw']:.6g}"
+        )
+
+        # is_better = (score < best["score"]) or (np.isclose(score, best["score"]) and ssim > best["ssim"])
+
+        # if is_better:
+        #     best = {"epoch": epoch, "score": score, "ssim": ssim}
+        #     torch.save(autoencoder.state_dict(),   os.path.join(args.output_dir, "autoencoder-best.pth"))
+        #     torch.save(discriminator.state_dict(), os.path.join(args.output_dir, "discriminator-best.pth"))
+        #     wandb.run.summary["best_epoch"] = epoch
+        #     wandb.run.summary["best_val_total_loss"] = score
+        #     wandb.run.summary["best_val_ssim"] = ssim
+
+        # print(f"Best epoch: {best['epoch']} | Val total loss: {best['score']:.6g} | Val SSIM: {best['ssim']:.6g}")
 
         # Save the model after each epoch.
         torch.save(discriminator.state_dict(), os.path.join(args.output_dir, f'discriminator-ep-{epoch}.pth'))
