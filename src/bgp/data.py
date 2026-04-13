@@ -6,7 +6,7 @@ from monai.data import Dataset, PersistentDataset
 from monai.transforms.transform import Transform
 
 
-def get_dataset_from_pd(df: pd.DataFrame, transforms_fn: Transform, cache_dir: Optional[str]) -> Union[Dataset,PersistentDataset]: 
+def get_dataset_from_pd(df: pd.DataFrame, transforms_fn: Transform, cache_dir: Optional[str] = None) -> Union[Dataset,PersistentDataset]: 
     """
     If `cache_dir` is defined, returns a `monai.data.PersistenDataset`. 
     Otherwise, returns a simple `monai.data.Dataset`.

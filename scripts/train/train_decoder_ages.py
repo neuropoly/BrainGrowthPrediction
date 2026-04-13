@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import L1Loss
 import copy
@@ -21,6 +22,8 @@ from PIL import Image
 from collections import deque
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from generative.losses import PerceptualLoss, PatchAdversarialLoss
+from monai.networks.blocks import Convolution
+from generative.networks.nets.autoencoderkl import ResBlock, AttentionBlock, Upsample
 from monai.metrics.regression import compute_ssim_and_cs, KernelType
 from monai.metrics import SSIMMetric
 from monai.utils import set_determinism
@@ -137,6 +140,384 @@ def log_recon_3x4_to_wandb(
         wandb.log({tag: wandb.Image(tmp)})
     os.remove(tmp)
 
+def log_recon_3x10_to_wandb(
+    meta: dict,
+    t1_vol_np: np.ndarray,
+    t1_recon_np: np.ndarray,
+    t2_recon_np: np.ndarray,
+    t2_true_np: np.ndarray,
+    t2_pred_np: np.ndarray,
+    step: int | None = None,
+    tag: str = "Recon 3x10",
+    output_dir: str = ".",
+):
+    """
+    Logs a single 3×10 grid for:
+      [T1 input, T1 recon, T2 recon, T2 true, T2 pred,
+       Sobel(T2pred) - Sobel(T1recon),
+       Sobel(T2pred) - Sobel(T1input),
+       Sobel(T2pred) - Sobel(T2true),
+       Sobel(T2recon) - Sobel(T1recon),
+       Sobel(T2true) - Sobel(T1input)]
+
+    across 3 views, with:
+      - one shared horizontal grayscale bar under columns 1–5
+      - one horizontal diff bar under each Sobel-diff column (6–10)
+      - one common symmetric diff limit for all 5 diff columns
+    """
+
+    def _robust_sym_lim(x: np.ndarray, q: float = 99.0, eps: float = 1e-8) -> float:
+        v = float(np.percentile(np.abs(x), q))
+        return max(v, eps)
+
+    def _sobel_3d_magnitude(vol_np: np.ndarray) -> np.ndarray:
+        x = torch.from_numpy(vol_np).float()[None, None]  # [1,1,D,H,W]
+
+        d = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+        s = torch.tensor([1.0, 2.0, 1.0], dtype=torch.float32)
+
+        kz = d[:, None, None] * s[None, :, None] * s[None, None, :]
+        ky = s[:, None, None] * d[None, :, None] * s[None, None, :]
+        kx = s[:, None, None] * s[None, :, None] * d[None, None, :]
+
+        kx = kx[None, None].to(x.device)
+        ky = ky[None, None].to(x.device)
+        kz = kz[None, None].to(x.device)
+
+        gx = F.conv3d(x, kx, padding=1)
+        gy = F.conv3d(x, ky, padding=1)
+        gz = F.conv3d(x, kz, padding=1)
+
+        gmag = torch.sqrt(gx * gx + gy * gy + gz * gz + 1e-8)
+        return gmag[0, 0].cpu().numpy()
+
+    # Drop channel dim -> [D,H,W]
+    t1 = t1_vol_np[0]
+    r1 = t1_recon_np[0]
+    r2 = t2_recon_np[0]
+    t2 = t2_true_np[0]
+    p2 = t2_pred_np[0]
+
+    D, H, W = t1.shape
+    iz, iy, ix = D // 2, H // 2, W // 2
+
+    # Sobel edge magnitudes
+    s_t1 = _sobel_3d_magnitude(t1)
+    s_r1 = _sobel_3d_magnitude(r1)
+    s_r2 = _sobel_3d_magnitude(r2)
+    s_t2 = _sobel_3d_magnitude(t2)
+    s_p2 = _sobel_3d_magnitude(p2)
+
+    # Sobel difference maps (signed)
+    d_p2_r1 = s_p2 - s_r1
+    d_p2_t1 = s_p2 - s_t1
+    d_p2_t2 = s_p2 - s_t2
+    d_r2_r1 = s_r2 - s_r1
+    d_t2_t1 = s_t2 - s_t1
+
+    # Common symmetric limit across all 5 diff columns
+    all_diffs = np.concatenate(
+        [
+            d_p2_r1.ravel(),
+            d_p2_t1.ravel(),
+            d_p2_t2.ravel(),
+            d_r2_r1.ravel(),
+            d_t2_t1.ravel(),
+        ]
+    )
+    common_diff_lim = _robust_sym_lim(all_diffs)
+
+    images = [
+        # Row 1
+        t1[iz, :, :], r1[iz, :, :], r2[iz, :, :], t2[iz, :, :], p2[iz, :, :],
+        d_p2_r1[iz, :, :], d_p2_t1[iz, :, :], d_p2_t2[iz, :, :], d_r2_r1[iz, :, :], d_t2_t1[iz, :, :],
+        # Row 2
+        t1[:, iy, :], r1[:, iy, :], r2[:, iy, :], t2[:, iy, :], p2[:, iy, :],
+        d_p2_r1[:, iy, :], d_p2_t1[:, iy, :], d_p2_t2[:, iy, :], d_r2_r1[:, iy, :], d_t2_t1[:, iy, :],
+        # Row 3
+        t1[:, :, ix], r1[:, :, ix], r2[:, :, ix], t2[:, :, ix], p2[:, :, ix],
+        d_p2_r1[:, :, ix], d_p2_t1[:, :, ix], d_p2_t2[:, :, ix], d_r2_r1[:, :, ix], d_t2_t1[:, :, ix],
+    ]
+
+    sa = meta.get("start_age", None)
+    fa = meta.get("followup_age", None)
+    sid = meta.get("subject_id", "")
+    uid = meta.get("image_uid", "")
+
+    top_title = f"{sid}  |  ΔAge={(fa - sa):.2f} mo" if sa is not None and fa is not None else sid
+    if uid:
+        top_title += f"  |  UID={uid}"
+
+    cols = [
+        "T₁ Input",
+        "T₁ Recon",
+        "T₂ Recon",
+        "T₂ True",
+        "T₂ Pred",
+        "Sobel(T₂Pred) − Sobel(T₁Recon)",
+        "Sobel(T₂Pred) − Sobel(T₁Input)",
+        "Sobel(T₂Pred) − Sobel(T₂True)",
+        "Sobel(T₂Recon) − Sobel(T₁Recon)",
+        "Sobel(T₂True) − Sobel(T₁Input)",
+    ]
+    rows = ["Axial", "Coronal", "Sagittal"]
+
+    titles = []
+    for view in rows:
+        for col in cols:
+            if view == "Axial" and col == "T₁ Input" and sa is not None:
+                titles.append(f"{col}\n(age={sa:.2f})")
+            elif view == "Axial" and col == "T₂ True" and fa is not None:
+                titles.append(f"{col}\n(age={fa:.2f})")
+            else:
+                titles.append(col)
+
+    fig, axes = plt.subplots(3, 10, figsize=(34, 12))
+    axes = np.asarray(axes)
+
+    column_mappables = [None] * 10
+
+    k = 0
+    for r in range(3):
+        for c in range(10):
+            ax = axes[r, c]
+            img = images[k]
+            ttl = titles[k]
+            k += 1
+
+            if c <= 4:
+                im = ax.imshow(np.rot90(img), cmap="gray", vmin=0, vmax=1)
+            else:
+                im = ax.imshow(np.rot90(img), cmap="seismic", vmin=-common_diff_lim, vmax=common_diff_lim)
+
+            if column_mappables[c] is None:
+                column_mappables[c] = im
+
+            ax.set_title(ttl, fontsize=9)
+            ax.axis("off")
+
+    fig.suptitle(top_title, fontsize=14)
+    fig.subplots_adjust(left=0.02, right=0.985, top=0.92, bottom=0.14, wspace=0.04, hspace=0.08)
+
+    cbar_height = 0.014
+    cbar_gap = 0.02
+
+    # Shared grayscale bar under columns 1–5
+    pos_left = axes[2, 0].get_position()
+    pos_right = axes[2, 4].get_position()
+
+    gray_x0 = pos_left.x0
+    gray_width = pos_right.x1 - pos_left.x0
+    gray_y = pos_left.y0 - cbar_gap - cbar_height
+
+    cax_gray = fig.add_axes([gray_x0, gray_y, gray_width, cbar_height])
+    gray_bar = fig.colorbar(column_mappables[0], cax=cax_gray, orientation="horizontal")
+    gray_bar.set_label("Intensity", fontsize=8)
+    gray_bar.set_ticks([0.0, 0.5, 1.0])
+    gray_bar.ax.tick_params(labelsize=7)
+
+    # One Sobel-diff bar under each diff column, all with same range
+    for c in range(5, 10):
+        pos = axes[2, c].get_position()
+        cax = fig.add_axes([pos.x0, pos.y0 - cbar_gap - cbar_height, pos.width, cbar_height])
+
+        cbar = fig.colorbar(column_mappables[c], cax=cax, orientation="horizontal")
+        cbar.set_label("Δ Sobel", fontsize=8)
+        cbar.set_ticks([-common_diff_lim, 0.0, common_diff_lim])
+        cbar.ax.tick_params(labelsize=7)
+
+    os.makedirs(output_dir, exist_ok=True)
+    tmp = f"{output_dir}/tmp_{sid}_{uid}_3x10.png"
+
+    plt.savefig(tmp, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    payload = {tag: wandb.Image(str(tmp))}
+    if step is not None:
+        payload["opt_step"] = step
+    wandb.log(payload)
+
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+# def log_recon_3x10_to_wandb(
+#     meta: dict,
+#     t1_vol_np: np.ndarray,
+#     t1_recon_np: np.ndarray,
+#     t2_recon_np: np.ndarray,
+#     t2_true_np: np.ndarray,
+#     t2_pred_np: np.ndarray,
+#     step: int | None = None,
+#     tag: str = "Recon 3x10",
+#     output_dir: str = ".",
+# ):
+#     """
+#     Logs a single 3×10 grid for:
+#       [T1 input, T1 recon, T2 recon, T2 true, T2 pred,
+#        (T2pred - T1recon), (T2pred - T2recon), (T2pred - T2true),
+#        (T2recon - T1recon), (T2true - T1input)]
+#     across 3 views, with:
+#       - one shared horizontal grayscale bar under columns 1–5
+#       - one horizontal diff bar under each diff column (6–10)
+#     """
+
+#     # Drop channel dim -> [D,H,W]
+#     t1 = t1_vol_np[0]
+#     r1 = t1_recon_np[0]
+#     r2 = t2_recon_np[0]
+#     t2 = t2_true_np[0]
+#     p2 = t2_pred_np[0]
+
+#     D, H, W = t1.shape
+#     iz, iy, ix = D // 2, H // 2, W // 2
+
+#     # Difference maps (signed)
+#     d_p2_r1 = p2 - r1
+#     d_p2_r2 = p2 - r2
+#     d_p2_t2 = p2 - t2
+#     d_r2_r1 = r2 - r1
+#     d_t2_t1 = t2 - t1
+
+#     def _robust_sym_lim(x: np.ndarray, q: float = 99.0, eps: float = 1e-8) -> float:
+#         v = float(np.percentile(np.abs(x), q))
+#         return max(v, eps)
+
+#     lim_p2_r1 = _robust_sym_lim(d_p2_r1)
+#     lim_p2_r2 = _robust_sym_lim(d_p2_r2)
+#     lim_p2_t2 = _robust_sym_lim(d_p2_t2)
+#     lim_r2_r1 = _robust_sym_lim(d_r2_r1)
+#     lim_t2_t1 = _robust_sym_lim(d_t2_t1)
+
+#     images = [
+#         # Row 1
+#         t1[iz, :, :], r1[iz, :, :], r2[iz, :, :], t2[iz, :, :], p2[iz, :, :],
+#         d_p2_r1[iz, :, :], d_p2_r2[iz, :, :], d_p2_t2[iz, :, :], d_r2_r1[iz, :, :], d_t2_t1[iz, :, :],
+#         # Row 2
+#         t1[:, iy, :], r1[:, iy, :], r2[:, iy, :], t2[:, iy, :], p2[:, iy, :],
+#         d_p2_r1[:, iy, :], d_p2_r2[:, iy, :], d_p2_t2[:, iy, :], d_r2_r1[:, iy, :], d_t2_t1[:, iy, :],
+#         # Row 3
+#         t1[:, :, ix], r1[:, :, ix], r2[:, :, ix], t2[:, :, ix], p2[:, :, ix],
+#         d_p2_r1[:, :, ix], d_p2_r2[:, :, ix], d_p2_t2[:, :, ix], d_r2_r1[:, :, ix], d_t2_t1[:, :, ix],
+#     ]
+
+#     sa = meta.get("start_age", None)
+#     fa = meta.get("followup_age", None)
+#     sid = meta.get("subject_id", "")
+#     uid = meta.get("image_uid", "")
+
+#     top_title = f"{sid}  |  ΔAge={(fa - sa):.2f} mo" if sa is not None and fa is not None else sid
+#     if uid:
+#         top_title += f"  |  UID={uid}"
+
+#     cols = [
+#         "T₁ Input",
+#         "T₁ Recon",
+#         "T₂ Recon",
+#         "T₂ True",
+#         "T₂ Pred",
+#         "T₂Pred − T₁Recon",
+#         "T₂Pred − T₂Recon",
+#         "T₂Pred − T₂True",
+#         "T₂Recon − T₁Recon",
+#         "T₂True − T₁Input",
+#     ]
+#     rows = ["Axial", "Coronal", "Sagittal"]
+
+#     titles = []
+#     for view in rows:
+#         for col in cols:
+#             if view == "Axial" and col == "T₁ Input" and sa is not None:
+#                 titles.append(f"{col}\n(age={sa:.2f})")
+#             elif view == "Axial" and col == "T₂ True" and fa is not None:
+#                 titles.append(f"{col}\n(age={fa:.2f})")
+#             else:
+#                 titles.append(col)
+
+#     # Main grid
+#     fig, axes = plt.subplots(3, 10, figsize=(34, 12))
+#     axes = np.asarray(axes)
+
+#     # Representative mappable for each column
+#     column_mappables = [None] * 10
+#     diff_lims = {
+#         5: lim_p2_r1,
+#         6: lim_p2_r2,
+#         7: lim_p2_t2,
+#         8: lim_r2_r1,
+#         9: lim_t2_t1,
+#     }
+
+#     k = 0
+#     for r in range(3):
+#         for c in range(10):
+#             ax = axes[r, c]
+#             img = images[k]
+#             ttl = titles[k]
+#             k += 1
+
+#             if c <= 4:
+#                 im = ax.imshow(np.rot90(img), cmap="gray", vmin=0, vmax=1)
+#             else:
+#                 lim = diff_lims[c]
+#                 im = ax.imshow(np.rot90(img), cmap="seismic", vmin=-lim, vmax=lim)
+
+#             if column_mappables[c] is None:
+#                 column_mappables[c] = im
+
+#             ax.set_title(ttl, fontsize=10)
+#             ax.axis("off")
+
+#     fig.suptitle(top_title, fontsize=14)
+
+#     # Leave room at bottom for colorbars
+#     fig.subplots_adjust(left=0.02, right=0.985, top=0.92, bottom=0.14, wspace=0.04, hspace=0.08)
+
+#     cbar_height = 0.014
+#     cbar_gap = 0.02
+
+#     # --- Shared grayscale bar spanning columns 1–5 ---
+#     pos_left = axes[2, 0].get_position()
+#     pos_right = axes[2, 4].get_position()
+
+#     gray_x0 = pos_left.x0
+#     gray_width = pos_right.x1 - pos_left.x0
+#     gray_y = pos_left.y0 - cbar_gap - cbar_height
+
+#     cax_gray = fig.add_axes([gray_x0, gray_y, gray_width, cbar_height])
+#     gray_bar = fig.colorbar(column_mappables[0], cax=cax_gray, orientation="horizontal")
+#     gray_bar.set_label("Intensity", fontsize=8)
+#     gray_bar.set_ticks([0.0, 0.5, 1.0])
+#     gray_bar.ax.tick_params(labelsize=7)
+
+#     # --- One diff bar under each diff column (6–10) ---
+#     for c in range(5, 10):
+#         pos = axes[2, c].get_position()
+#         cax = fig.add_axes([pos.x0, pos.y0 - cbar_gap - cbar_height, pos.width, cbar_height])
+
+#         cbar = fig.colorbar(column_mappables[c], cax=cax, orientation="horizontal")
+#         lim = diff_lims[c]
+#         cbar.set_label("Δ intensity", fontsize=8)
+#         cbar.set_ticks([-lim, 0.0, lim])
+#         cbar.ax.tick_params(labelsize=7)
+
+#     os.makedirs(output_dir, exist_ok=True)
+#     tmp = f"{output_dir}/tmp_{sid}_{uid}_3x10.png"
+
+#     plt.savefig(tmp, dpi=120, bbox_inches="tight")
+#     plt.close(fig)
+
+#     payload = {tag: wandb.Image(str(tmp))}
+#     if step is not None:
+#         payload["opt_step"] = step
+#     wandb.log(payload)
+
+#     try:
+#         os.remove(tmp)
+#     except OSError:
+#         pass
+
 def log_recon_3x7_to_wandb(
     meta: dict,
     t1_vol_np: np.ndarray,
@@ -151,7 +532,7 @@ def log_recon_3x7_to_wandb(
     """
     Logs a single 3×7 grid for:
       [T1 input, T1 recon, T2 recon, T2 true, T2 pred, (T2pred - T1recon), (T2pred - T2recon)]
-    across [axial, coronal, sagittal] views, with colorbar scales for the two diff columns.
+    across 3 views, with one horizontal colorbar under each column (7 total).
     """
 
     # Drop channel dim -> [D,H,W]
@@ -168,7 +549,6 @@ def log_recon_3x7_to_wandb(
     d_p2_r1 = p2 - r1
     d_p2_r2 = p2 - r2
 
-    # Robust symmetric limits for difference visualization
     def _robust_sym_lim(x: np.ndarray, q: float = 99.0, eps: float = 1e-8) -> float:
         v = float(np.percentile(np.abs(x), q))
         return max(v, eps)
@@ -176,13 +556,12 @@ def log_recon_3x7_to_wandb(
     lim_r1 = _robust_sym_lim(d_p2_r1)
     lim_r2 = _robust_sym_lim(d_p2_r2)
 
-    # Prepare images in row-major order (3 rows × 7 cols = 21 panels)
     images = [
-        # Axial (axis=0)
+        # Row 1
         t1[iz, :, :], r1[iz, :, :], r2[iz, :, :], t2[iz, :, :], p2[iz, :, :], d_p2_r1[iz, :, :], d_p2_r2[iz, :, :],
-        # Coronal (axis=1)
+        # Row 2
         t1[:, iy, :], r1[:, iy, :], r2[:, iy, :], t2[:, iy, :], p2[:, iy, :], d_p2_r1[:, iy, :], d_p2_r2[:, iy, :],
-        # Sagittal (axis=2)
+        # Row 3
         t1[:, :, ix], r1[:, :, ix], r2[:, :, ix], t2[:, :, ix], p2[:, :, ix], d_p2_r1[:, :, ix], d_p2_r2[:, :, ix],
     ]
 
@@ -208,61 +587,80 @@ def log_recon_3x7_to_wandb(
             else:
                 titles.append(col)
 
-    # Plot 3×7
+    # Main grid
     fig, axes = plt.subplots(3, 7, figsize=(24, 12))
-    axes2d = axes  # keep 2D for easy indexing
-    axes = axes.flatten()
+    axes = np.asarray(axes)
 
-    im_diff_r1 = None
-    im_diff_r2 = None
+    # Store a representative mappable for each column
+    column_mappables = [None] * 7
 
-    for i, (ax, img, ttl) in enumerate(zip(axes, images, titles)):
-        col_idx = i % 7
-        is_diff_col = col_idx in (5, 6)
+    k = 0
+    for r in range(3):
+        for c in range(7):
+            ax = axes[r, c]
+            img = images[k]
+            ttl = titles[k]
+            k += 1
 
-        if is_diff_col:
-            lim = lim_r1 if col_idx == 5 else lim_r2
-            im = ax.imshow(np.rot90(img), cmap="seismic", vmin=-lim, vmax=lim)
-            if col_idx == 5 and im_diff_r1 is None:
-                im_diff_r1 = im
-            if col_idx == 6 and im_diff_r2 is None:
-                im_diff_r2 = im
-        else:
-            ax.imshow(np.rot90(img), cmap="gray", vmin=0, vmax=1)
+            if c <= 4:
+                im = ax.imshow(np.rot90(img), cmap="gray", vmin=0, vmax=1)
+            elif c == 5:
+                im = ax.imshow(np.rot90(img), cmap="seismic", vmin=-lim_r1, vmax=lim_r1)
+            elif c == 6:
+                im = ax.imshow(np.rot90(img), cmap="seismic", vmin=-lim_r2, vmax=lim_r2)
 
-        ax.set_title(ttl, fontsize=10)
-        ax.axis("off")
+            if column_mappables[c] is None:
+                column_mappables[c] = im
 
-    # Add colorbars for diff columns (one per column, spanning all 3 rows)
-    # Place them just to the right of the respective diff column.
-    if im_diff_r1 is not None:
-        cbar1 = fig.colorbar(
-            im_diff_r1,
-            ax=axes2d[:, 5],
-            fraction=0.025,
-            pad=0.02,
-        )
-        cbar1.set_label("Δ intensity", rotation=90)
-        # Optionally show symmetric ticks
-        cbar1.set_ticks([-lim_r1, 0.0, lim_r1])
-
-    if im_diff_r2 is not None:
-        cbar2 = fig.colorbar(
-            im_diff_r2,
-            ax=axes2d[:, 6],
-            fraction=0.025,
-            pad=0.02,
-        )
-        cbar2.set_label("Δ intensity", rotation=90)
-        cbar2.set_ticks([-lim_r2, 0.0, lim_r2])
+            ax.set_title(ttl, fontsize=10)
+            ax.axis("off")
 
     fig.suptitle(top_title, fontsize=14)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    # Save, log, remove
+    # Leave room at bottom
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.14, wspace=0.05, hspace=0.08)
+
+    cbar_height = 0.014
+    cbar_gap = 0.02
+
+    # --- Grayscale bar spanning columns 1–5 ---
+    pos_left  = axes[2, 0].get_position()
+    pos_right = axes[2, 4].get_position()
+
+    gray_x0 = pos_left.x0
+    gray_width = pos_right.x1 - pos_left.x0
+    gray_y = pos_left.y0 - cbar_gap - cbar_height
+
+    cax_gray = fig.add_axes([gray_x0, gray_y, gray_width, cbar_height])
+
+    # use any grayscale image mappable (e.g. first column)
+    gray_bar = fig.colorbar(column_mappables[0], cax=cax_gray, orientation="horizontal")
+    gray_bar.set_label("Intensity", fontsize=8)
+    gray_bar.set_ticks([0.0, 0.5, 1.0])
+    gray_bar.ax.tick_params(labelsize=7)
+
+    # --- Diff column 6 ---
+    pos6 = axes[2, 5].get_position()
+    cax6 = fig.add_axes([pos6.x0, pos6.y0 - cbar_gap - cbar_height, pos6.width, cbar_height])
+
+    cbar6 = fig.colorbar(column_mappables[5], cax=cax6, orientation="horizontal")
+    cbar6.set_label("Δ intensity", fontsize=8)
+    cbar6.set_ticks([-lim_r1, 0.0, lim_r1])
+    cbar6.ax.tick_params(labelsize=7)
+
+    # --- Diff column 7 ---
+    pos7 = axes[2, 6].get_position()
+    cax7 = fig.add_axes([pos7.x0, pos7.y0 - cbar_gap - cbar_height, pos7.width, cbar_height])
+
+    cbar7 = fig.colorbar(column_mappables[6], cax=cax7, orientation="horizontal")
+    cbar7.set_label("Δ intensity", fontsize=8)
+    cbar7.set_ticks([-lim_r2, 0.0, lim_r2])
+    cbar7.ax.tick_params(labelsize=7)
+
+    os.makedirs(output_dir, exist_ok=True)
     tmp = f"{output_dir}/tmp_{sid}_{uid}_3x7.png"
 
-    plt.savefig(tmp, dpi=120)
+    plt.savefig(tmp, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
     payload = {tag: wandb.Image(str(tmp))}
@@ -600,6 +998,138 @@ class AgeFiLMConditionalDecoder(nn.Module):
         x_pred = self.decoder_body(z_mod)
         return x_pred
 
+class FeatureFiLM(nn.Module):
+    def __init__(self, age_embed_dim: int, num_features: int):
+        super().__init__()
+        self.to_gamma = nn.Linear(age_embed_dim, num_features)
+        self.to_beta = nn.Linear(age_embed_dim, num_features)
+
+        # initialize as identity
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.zeros_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_beta.weight)
+        nn.init.zeros_(self.to_beta.bias)
+
+    def forward(self, x: torch.Tensor, age_emb: torch.Tensor) -> torch.Tensor:
+        gamma = self.to_gamma(age_emb)[:, :, None, None, None]
+        beta = self.to_beta(age_emb)[:, :, None, None, None]
+        return x * (1.0 + gamma) + beta
+
+
+class AgeResidualLatentDecoderPerChannelAlphaFiLM(nn.Module):
+    """
+    Latent residual conditioning + FiLM modulation during decoding.
+
+    Pipeline:
+        z_post = post_quant_conv(z)
+        delta  = cond_net([z_post, age_emb_broadcast])
+        z_mod  = z_post + tanh(alpha_c) * delta
+        x_pred = decoder(z_mod), with FiLM after selected decoder blocks
+    """
+    def __init__(self, pretrained_ae: nn.Module, age_embed_dim=64, hidden=64):
+        super().__init__()
+
+        self.post_quant_conv = copy.deepcopy(pretrained_ae.post_quant_conv)
+        self.decoder_body = copy.deepcopy(pretrained_ae.decoder)
+        self.latent_channels = getattr(pretrained_ae, "latent_channels", 3)
+
+        # age conditioning from [age0, age1, delta_t]
+        self.age_mlp = nn.Sequential(
+            nn.Linear(3, age_embed_dim),
+            nn.SiLU(),
+            nn.Linear(age_embed_dim, age_embed_dim),
+            nn.SiLU(),
+        )
+
+        # latent residual predictor
+        self.cond_net = nn.Sequential(
+            nn.Conv3d(self.latent_channels + age_embed_dim, hidden, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv3d(hidden, hidden, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv3d(hidden, self.latent_channels, kernel_size=3, padding=1),
+        )
+
+        nn.init.normal_(self.cond_net[-1].weight, mean=0.0, std=1e-5)
+        nn.init.zeros_(self.cond_net[-1].bias)
+
+        # per-channel residual scale
+        self.alpha = nn.Parameter(
+            torch.full((1, self.latent_channels, 1, 1, 1), 0.25)
+        )
+
+        # build FiLM layers only for selected decoder blocks
+        self.film_layers = nn.ModuleDict()
+        self.film_block_indices = []
+
+        for i, block in enumerate(self.decoder_body.blocks):
+            c = self._get_block_num_features(block)
+            if c is not None:
+                self.film_layers[str(i)] = FeatureFiLM(age_embed_dim, c)
+                self.film_block_indices.append(i)
+
+    def _get_block_num_features(self, block):
+        """
+        Return feature count for blocks we want to FiLM.
+        We skip GroupNorm / final output conv by returning None.
+        """
+        if isinstance(block, ResBlock):
+            return block.out_channels
+
+        if isinstance(block, AttentionBlock):
+            return block.num_channels
+
+        if isinstance(block, Upsample):
+            # In your MONAI/generative decoder this is typically the feature channel count
+            # after upsampling.
+            if hasattr(block, "conv") and hasattr(block.conv, "out_channels"):
+                return block.conv.out_channels
+            if hasattr(block, "conv") and hasattr(block.conv, "conv") and hasattr(block.conv.conv, "out_channels"):
+                return block.conv.conv.out_channels
+            return None
+
+        # optional: FiLM the first decoder Convolution block, but skip final image conv
+        if isinstance(block, Convolution):
+            # only keep if it is an internal feature block, not the final image projection
+            if hasattr(block, "conv") and hasattr(block.conv, "out_channels"):
+                out_c = block.conv.out_channels
+                if out_c != 1:  # assuming grayscale output; adjust if needed
+                    return out_c
+            return None
+
+        return None
+
+    def forward(self, z, age0, age1, return_latents: bool = False):
+        age0 = age0.to(z.device).float()
+        age1 = age1.to(z.device).float()
+        d_age = age1 - age0
+
+        age_vec = torch.cat([age0, age1, d_age], dim=1)  # [B,3]
+
+        z_post = self.post_quant_conv(z)  # [B,C,D,H,W]
+        age_emb = self.age_mlp(age_vec)   # [B,E]
+
+        age_vol = age_emb[:, :, None, None, None].expand(
+            -1, -1, z_post.shape[2], z_post.shape[3], z_post.shape[4]
+        )
+
+        delta = self.cond_net(torch.cat([z_post, age_vol], dim=1))
+        scale = torch.tanh(self.alpha)
+        z_mod = z_post + scale * delta
+
+        x = z_mod
+        for i, block in enumerate(self.decoder_body.blocks):
+            x = block(x)
+            key = str(i)
+            if key in self.film_layers:
+                x = self.film_layers[key](x, age_emb)
+
+        x_pred = x
+
+        if return_latents:
+            return x_pred, z_post, z_mod, delta, scale, age_emb
+        return x_pred
+
 class AgeResidualLatentDecoder(nn.Module):
     """
     Spatial latent residual conditioning:
@@ -662,6 +1192,79 @@ class AgeResidualLatentDecoder(nn.Module):
         z_mod = z_post + scale * delta
 
         return self.decoder_body(z_mod)
+
+class AgeResidualLatentDecoderPerChannelAlpha(nn.Module):
+    """
+    Spatial latent residual conditioning:
+        z_post = post_quant_conv(z)
+        delta  = cond_net([z_post, age_embroadcast])
+        z_mod  = z_post + tanh(alpha_c) * delta
+        x_pred = decoder_body(z_mod)
+
+    Changes vs previous version:
+    - alpha is per-channel instead of a single scalar
+    - alpha initialized slightly > 0 so the model is not fully locked at identity
+    - optional return_latents for debugging / extra supervision later
+    """
+    def __init__(self, pretrained_ae: torch.nn.Module, age_embed_dim=64, hidden=64):
+        super().__init__()
+        self.post_quant_conv = copy.deepcopy(pretrained_ae.post_quant_conv)
+        self.decoder_body = copy.deepcopy(pretrained_ae.decoder)
+
+        self.latent_channels = getattr(pretrained_ae, "latent_channels", 3)
+
+        # ages -> embedding
+        self.age_mlp = nn.Sequential(
+            nn.Linear(3, age_embed_dim),
+            nn.SiLU(),
+            nn.Linear(age_embed_dim, age_embed_dim),
+            nn.SiLU(),
+        )
+
+        # spatial residual in latent space
+        self.cond_net = nn.Sequential(
+            nn.Conv3d(self.latent_channels + age_embed_dim, hidden, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv3d(hidden, hidden, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv3d(hidden, self.latent_channels, 3, padding=1),
+        )
+
+        # small initial delta
+        nn.init.normal_(self.cond_net[-1].weight, mean=0.0, std=1e-5)
+        nn.init.zeros_(self.cond_net[-1].bias)
+
+        # per-channel learnable scale; initialize slightly > 0
+        # tanh(0.25) ~= 0.245, so the model has some ability to change from the start
+        self.alpha = nn.Parameter(
+            torch.full((1, self.latent_channels, 1, 1, 1), 0.25)
+        )
+
+    def forward(self, z, age0, age1, return_latents: bool = False):
+        age0 = age0.to(z.device).float()
+        age1 = age1.to(z.device).float()
+        d_age = age1 - age0
+
+        age_vec = torch.cat([age0, age1, d_age], dim=1)  # [B,3]
+
+        z_post = self.post_quant_conv(z)  # [B,C,d,h,w]
+
+        age_emb = self.age_mlp(age_vec)  # [B,E]
+        age_vol = age_emb[:, :, None, None, None].expand(
+            -1, -1, z_post.shape[2], z_post.shape[3], z_post.shape[4]
+        )
+
+        inp = torch.cat([z_post, age_vol], dim=1)
+        delta = self.cond_net(inp)
+
+        scale = torch.tanh(self.alpha)   # [1,C,1,1,1]
+        z_mod = z_post + scale * delta
+
+        x_pred = self.decoder_body(z_mod)
+
+        if return_latents:
+            return x_pred, z_post, z_mod, delta, scale
+        return x_pred
 # #Still MLP, but starts closer to T1, TO TEST
 # class AgeVectorConditionalDecoder(nn.Module):
 #     def __init__(self, pretrained_ae: torch.nn.Module, age_embed_dim=16):
@@ -996,6 +1599,7 @@ def evaluate_one_epoch(
     adv_weight: float = 0.0,
     identity_weight: float = 0.0,
     delta_weight: float = 0.0,
+    delta_sup_weight: float = 0.0,
     ssim_metric=None,                 # expects (pred, target)->tensor [B] or scalar
     age_axis=None, dt_axis=None, Wgrid=None,  # for bilinear_lookup_weight
     jac_abs_thresh: float = 0.0,      ):
@@ -1024,6 +1628,7 @@ def evaluate_one_epoch(
         "ssim_t1recon_t2": 0.0,
         "idt": 0.0,
         "delta": 0.0,
+        "delta_sup": 0.0,
     }
 
     for batch in loader:
@@ -1049,7 +1654,8 @@ def evaluate_one_epoch(
 
             need_recon0 = (
                 (delta_weight > 0)
-                or (identity_weight > 0)  # only if you want identity vs recon0
+                or (delta_sup_weight > 0)
+                or (identity_weight > 0)
             )
 
             recon0 = None
@@ -1072,6 +1678,14 @@ def evaluate_one_epoch(
                 a0 = age0.view(-1)
                 w = bilinear_lookup_weight(a0, dt, age_axis, dt_axis, Wgrid).clamp(0.0, 1.0)
                 delta_loss = (w * ssim_per).mean()
+
+            #delta-sup
+            delta_sup_loss = torch.tensor(0.0, device=device)
+            # supervised delta
+            if (delta_sup_weight > 0) and (recon0 is not None):
+                pred_delta = x1_pred.float() - recon0.float()
+                true_delta = img1.float() - recon0.float()
+                delta_sup_loss = l1_loss_fn(pred_delta, true_delta)
 
             gen_adv_loss = torch.tensor(0.0, device=device)
             loss_d = torch.tensor(0.0, device=device)
@@ -1099,6 +1713,7 @@ def evaluate_one_epoch(
                 + gen_adv_loss
                 + (identity_weight * identity_loss)
                 + (delta_weight * delta_loss)
+                + (delta_sup_weight * delta_sup_loss)
             )
 
             # ---- SSIMs ----
@@ -1123,6 +1738,7 @@ def evaluate_one_epoch(
         sums["total"] += bsz * float(loss_g.item())
         sums["idt"]   += bsz * float(identity_loss.item())
         sums["delta"] += bsz * float(delta_loss.item())
+        sums["delta_sup"] += bsz * float(delta_sup_loss.item())
         sums["d"]     += bsz * float(loss_d.item())
 
         sums["ssim_pred_t2"] += bsz * float(ssim_pred_t2.item())
@@ -1300,10 +1916,14 @@ if __name__ == '__main__':
     parser.add_argument('--adv_weight',         default=0.025, type=float)
     parser.add_argument('--reconstruction_weight',         default=1, type=float)
     parser.add_argument('--perceptual_weight',  default=0.001, type=float)
+    parser.add_argument("--delta_sup_weight", type=float, default=1.0)
     parser.add_argument('--discriminative_lr',  default=0.1, type=float,
                         help="How much to adapt old layers versus new ones for fine-tuning (At 0.1; old layers do adapt, but at a slower pace than new ones)")
+    parser.add_argument("--unfreeze_post_quant_conv", action="store_true")
+    parser.add_argument('--post_quant_lr_factor',  default=0.05, type=float,
+                        help="How much to adapt the post_quant_layers if unfrozen")
     parser.add_argument('--age_embed_dim',  default=16, type=int)
-    parser.add_argument('--decoder_k_blocks_to_unfreeze',  default=2, type=int)
+    parser.add_argument('--decoder_k_blocks_to_unfreeze',  type=str, default="2", help='Number of last decoder blocks to unfreeze, or "all".')
     parser.add_argument('--project',        default="age_conditional_decoder_ages", type=str,
                         help="W&B project name")
     parser.add_argument('--run_name',       default=None,   type=str,
@@ -1434,11 +2054,17 @@ if __name__ == '__main__':
 
     # ─── Instantiate AgeConditionalDecoder ────────────────────────
     age_embed_dim = args.age_embed_dim
-    #With convnet
-    cond_decoder = AgeResidualLatentDecoder(
-    pretrained_ae=autoencoder,
-    age_embed_dim=args.age_embed_dim,
-    hidden=64,  # try 32 
+    # #With convnet
+    # cond_decoder = AgeResidualLatentDecoderPerChannelAlpha(
+    # pretrained_ae=autoencoder,
+    # age_embed_dim=args.age_embed_dim,
+    # hidden=64,  # try 32 
+    # ).to(DEVICE)
+    # ─── Instantiate FiLM conditional decoder ──────────────────────
+    cond_decoder = AgeResidualLatentDecoderPerChannelAlphaFiLM(
+        pretrained_ae=autoencoder,
+        age_embed_dim=args.age_embed_dim,
+        hidden=64,
     ).to(DEVICE)
 
     # Freeze everything in cond_decoder first
@@ -1453,16 +2079,34 @@ if __name__ == '__main__':
     cond_decoder.alpha.requires_grad = True
 
     # Optionally: unfreeze last k blocks of the copied decoder
-    k = args.decoder_k_blocks_to_unfreeze
-    blocks = cond_decoder.decoder_body.blocks  # <-- ModuleList from MONAI Decoder
+    k_arg = str(args.decoder_k_blocks_to_unfreeze).strip().lower()
+    blocks = cond_decoder.decoder_body.blocks  # ModuleList from MONAI Decoder
 
-    if k > 0:
-        for blk in list(blocks)[-k:]:
-            for p in blk.parameters():
-                p.requires_grad = True
+    if k_arg == "all":
+        selected_blocks = list(blocks)
+    elif k_arg.isdigit():
+        k = int(k_arg)
+        if k < 0:
+            raise ValueError("--decoder-k-blocks-to-unfreeze must be >= 0 or 'all'")
+        selected_blocks = list(blocks)[-k:] if k > 0 else []
+    else:
+        raise ValueError("--decoder-k-blocks-to-unfreeze must be an integer or 'all'")
 
+    for blk in selected_blocks:
+        for p in blk.parameters():
+            p.requires_grad = True
+    print(f"Unfreezing {len(selected_blocks)}/{len(blocks)} decoder blocks")
+
+    # Optional: keep this False for first experiment, then test True later
+    if getattr(args, "unfreeze_post_quant_conv", False):
+        for p in cond_decoder.post_quant_conv.parameters():
+            p.requires_grad = True
+    else:
+        for p in cond_decoder.post_quant_conv.parameters():
+            p.requires_grad = False
+
+    # ─── Full model ────────────────────────────────────────────────
     model = FullPredictor(autoencoder, cond_decoder).to(DEVICE)
-
     print("same cond_decoder object:", model.cond_decoder is cond_decoder)  # adjust attribute if needed
 
     # ─── Losses & Optimizers ─────────────────────────────────────
@@ -1478,30 +2122,114 @@ if __name__ == '__main__':
             fake_3d_ratio=0.2
         ).to(DEVICE)
 
+    # ─── Parameter groups ──────────────────────────────────────────
+    def unique_params(*param_lists):
+    seen = set()
+    out = []
+    for plist in param_lists:
+        for p in plist:
+            if p.requires_grad and id(p) not in seen:
+                seen.add(id(p))
+                out.append(p)
+    return out
+
+
     params_new = (
-    list(cond_decoder.age_mlp.parameters())
-    + list(cond_decoder.cond_net.parameters())
-    + [cond_decoder.alpha]
+        list(cond_decoder.age_mlp.parameters())
+        + list(cond_decoder.cond_net.parameters())
+        + [cond_decoder.alpha]
     )
 
-    params_old = [p for p in cond_decoder.decoder_body.parameters() if p.requires_grad]
+    params_film = []
+    for film in cond_decoder.film_layers.values():
+        params_film += list(film.parameters())
 
+    # all copied decoder parameters currently unfrozen
+    params_decoder = [
+        p for p in cond_decoder.decoder_body.parameters() if p.requires_grad
+    ]
 
+    params_post = [
+        p for p in cond_decoder.post_quant_conv.parameters() if p.requires_grad
+    ]
+
+    param_groups = [
+        {"params": unique_params(params_new), "lr": config.lr},
+        {"params": unique_params(params_film), "lr": config.lr},
+    ]
+
+    decoder_group = unique_params(params_decoder)
+    if len(decoder_group) > 0:
+        param_groups.append(
+            {"params": decoder_group, "lr": config.lr * args.discriminative_lr}
+        )
+
+    post_group = unique_params(params_post)
+    if len(post_group) > 0:
+        param_groups.append(
+            {"params": post_group, "lr": config.lr * args.post_quant_lr_factor}
+        )
+
+    optimizer_g = torch.optim.Adam(
+        param_groups,
+        weight_decay=1e-5
+    )
+    # params_new = (
+    # list(cond_decoder.age_mlp.parameters())
+    # + list(cond_decoder.cond_net.parameters())
+    # + [cond_decoder.alpha]
+    # )
+
+    # # params_old = [p for p in cond_decoder.decoder_body.parameters() if p.requires_grad]
+    # params_decoder = [
+    # p for p in cond_decoder.decoder_body.parameters() if p.requires_grad
+    # ]
+
+    # params_post = [
+    #     p for p in cond_decoder.post_quant_conv.parameters() if p.requires_grad
+    # ]
+
+    # # Example LR strategy:
+    # # - conditioning path gets full LR
+    # # - pretrained decoder gets smaller LR
+    # # - post_quant_conv gets even smaller LR if unfrozen
+    # param_groups = [
+    #     {"params": params_new, "lr": config.lr},
+    #     {"params": params_decoder, "lr": config.lr * args.discriminative_lr},
+    # ]
+
+    # if len(params_post) > 0:
+    #     param_groups.append(
+    #         {"params": params_post, "lr": config.lr * args.post_quant_lr_factor}
+    #     )
+
+    # optimizer_g = torch.optim.Adam(
+    #     param_groups,
+    #     weight_decay=1e-5
+    # )
+
+    # ─── Debug prints ──────────────────────────────────────────────
     count_trainable(cond_decoder)
     for name, p in cond_decoder.named_parameters():
         if p.requires_grad:
             print("TRAIN:", name, p.shape)
 
-    optimizer_g = torch.optim.Adam(
-        [
-            {"params": params_new, "lr": config.lr},
-            {"params": params_old, "lr": config.lr * args.discriminative_lr},
-        ],
-        weight_decay=1e-5
-    )
     alpha = model.cond_decoder.alpha
     in_opt = any(p is alpha for g in optimizer_g.param_groups for p in g["params"])
     print("[debug] alpha requires_grad:", alpha.requires_grad, "| alpha in optimizer:", in_opt)
+
+    print("[debug] FiLM block indices:", cond_decoder.film_block_indices)
+
+    for i, block in enumerate(cond_decoder.decoder_body.blocks):
+    has_film = str(i) in cond_decoder.film_layers
+    any_trainable = any(p.requires_grad for p in block.parameters())
+    print(
+        f"[debug] block {i:02d} | "
+        f"type={block.__class__.__name__} | "
+        f"FiLM={has_film} | "
+        f"trainable={any_trainable}"
+    )
+    # Gradient accumulation
     if args.adv_weight > 0:
         optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=config.lr)
         gradacc_d = GradientAccumulation(
@@ -1584,16 +2312,25 @@ if __name__ == '__main__':
             #         x0_id = model(img0, age0, age0)  # [B,1,D,H,W]
 
             with autocast(enabled=True):
+                # Follow-up prediction
                 x1_pred = model(img0, age0, age1)  # [B,1,D,H,W]
+                # Identity / no-change prediction
                 x0_id = model(img0, age0, age0)
 
                 # AE reconstruction baseline (frozen AE)
                 with torch.no_grad():
                     recon0 = autoencoder.reconstruct(img0)  # [B,1,D,H,W]  (adapt name if needed)
 
+                # ---------------------------------------------------------
+                # 1) Identity loss
+                # ---------------------------------------------------------
                 # identity loss: make baseline no-change prediction match baseline image
                 identity_loss = l1_loss_fn(x0_id.float(), recon0.float())
 
+                # ---------------------------------------------------------
+                # 2) Existing RBF-weighted change encouragement
+                #    encourage x1_pred to move away from baseline recon
+                # ---------------------------------------------------------
                 # per-sample SSIM between predicted follow-up and baseline recon
                 # (minimize SSIM -> encourage change away from baseline)
                 # ssim_per = ssim_metric(x1_pred.float(), recon0.float()).view(-1)  # tensor [B]
@@ -1644,17 +2381,40 @@ if __name__ == '__main__':
                 else:
                     gen_adv_loss = torch.tensor(0.0, device=DEVICE)
 
-
+                # ---------------------------------------------------------
+                # 3) Reconstruction / perceptual losses to true follow-up
+                # ---------------------------------------------------------
                 # Reconstruction (L1) between x1_pred and img1
                 rec_loss = l1_loss_fn(x1_pred.float(), img1.float())
 
                 # Optional perceptual loss
                 perc_loss = perc_loss_fn(x1_pred.float(), img1.float())
 
+
+                # ---------------------------------------------------------
+                # 4) NEW: supervised delta loss
+                #    predicted change should match true change
+                # ---------------------------------------------------------
+                pred_delta = x1_pred.float() - recon0.float()
+                true_delta = img1.float() - recon0.float()
+                delta_sup_loss = l1_loss_fn(pred_delta, true_delta)
+
                 #If SSIM
                 # loss_g = args.reconstruction_weight * rec_loss + gen_adv_loss + args.perceptual_weight * perc_loss + args.delta_weight * delta_loss + args.identity_weight * identity_loss
                 # If 1-SSIM
-                loss_g = args.reconstruction_weight * rec_loss + gen_adv_loss + args.perceptual_weight * perc_loss - args.delta_weight * delta_loss + args.identity_weight * identity_loss
+                # loss_g = args.reconstruction_weight * rec_loss + gen_adv_loss + args.perceptual_weight * perc_loss - args.delta_weight * delta_loss + args.identity_weight * identity_loss
+
+                # ---------------------------------------------------------
+                # 7) Final generator loss
+                # ---------------------------------------------------------
+                loss_g = (
+                    args.reconstruction_weight * rec_loss
+                    + args.perceptual_weight * perc_loss
+                    + args.identity_weight * identity_loss
+                    + args.delta_sup_weight * delta_sup_loss
+                    - args.delta_weight * delta_loss
+                    + gen_adv_loss
+                )
 
                 if step == 0 and epoch == 0:
                     print("x1_pred:", tuple(x1_pred.shape))
@@ -1685,11 +2445,13 @@ if __name__ == '__main__':
             avgloss.put('Generator/perc_loss', perc_loss.item())
             avgloss.put('Generator/identity_loss', identity_loss.item())
             avgloss.put('Generator/delta_loss', delta_loss.item())
+            avgloss.put('Generator/delta_sup_loss', delta_sup_loss.item())
             avgloss.put('Generator/total',      loss_g.item())
             avgloss.put("Generator/perc_contrib", (args.perceptual_weight * perc_loss).item())
             avgloss.put('Generator/rec_contrib', (args.reconstruction_weight * rec_loss).item())
             avgloss.put("Generator/identity_contrib", (args.identity_weight * identity_loss).item())
             avgloss.put("Generator/delta_contrib", (args.delta_weight * delta_loss).item())
+            avgloss.put("Generator/delta_sup_contrib", (args.delta_sup_weight * delta_sup_loss).item())
             if args.adv_weight > 0:
                 avgloss.put('Generator/adv_loss', gen_adv_loss.item())
                 avgloss.put('Discriminator/loss', loss_d.item())
@@ -1701,6 +2463,7 @@ if __name__ == '__main__':
                     "g_perc": f"{perc_loss.item():.4f}",
                     "g_idt": f"{identity_loss.item():.4f}",
                     "g_delta": f"{delta_loss.item():.4f}",
+                    "g_delta_sup": f"{delta_sup_loss.item():.4f}",
                     "g_total": f"{loss_g.item():.4f}",
                     # "g_adv": f"{gen_adv_loss.item():.4f}",
                     # "d": f"{loss_d.item():.4f}",
@@ -1737,11 +2500,13 @@ if __name__ == '__main__':
                         "train/gen/perc_loss":     avgloss.pop_avg("Generator/perc_loss"),
                         "train/gen/identity_loss": avgloss.pop_avg("Generator/identity_loss"),
                         "train/gen/delta_loss":    avgloss.pop_avg("Generator/delta_loss"),
+                        "train/gen/delta_sup_loss":    avgloss.pop_avg("Generator/delta_sup_loss"),
                         "train/gen/total":         avgloss.pop_avg("Generator/total"),
                         "train/gen/perc_contrib":     avgloss.pop_avg("Generator/perc_contrib"),
                         "train/gen/rec_contrib":     avgloss.pop_avg("Generator/rec_contrib"),
                         "train/gen/identity_contrib": avgloss.pop_avg("Generator/identity_contrib"),
                         "train/gen/delta_contrib":    avgloss.pop_avg("Generator/delta_contrib"),
+                        "train/gen/delta_sup_contrib":    avgloss.pop_avg("Generator/delta_sup_contrib"),
                         "epoch": epoch,
                         "micro_step": micro_counter,
                         "opt_step": total_counter,
@@ -1789,7 +2554,7 @@ if __name__ == '__main__':
                     #     step=total_counter,
                     #     tag="Train/Recon_Pred"
                     # )
-                    log_recon_3x7_to_wandb(
+                    log_recon_3x10_to_wandb(
                         meta=meta,
                         t1_vol_np=baseline_vol,
                         t1_recon_np=recon0_vol,
@@ -1883,6 +2648,7 @@ if __name__ == '__main__':
 
             identity_weight=args.identity_weight,
             delta_weight=args.delta_weight,
+            delta_sup_weight=args.delta_sup_weight,
             ssim_metric=ssim_metric,          # your per-sample metric used in train
             age_axis=age_axis,
             dt_axis=dt_axis,
@@ -1904,6 +2670,7 @@ if __name__ == '__main__':
             "val/loss/perc": val_means["perc"],
             "val/loss/idt":   val_means["idt"],
             "val/loss/delta": val_means["delta"],
+            "val/loss/delta_sup": val_means["delta_sup"],
             "val/loss/total": val_means["total"],
             
 

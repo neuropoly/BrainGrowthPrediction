@@ -11,7 +11,7 @@ from monai.transforms import (
 )
 
 # adjust imports to match your repo
-from scripts.train.train_decoder_ages import init_autoencoder, AgeResidualLatentDecoder, FullPredictor
+from scripts.train.train_decoder_ages import init_autoencoder, AgeResidualLatentDecoder, AgeResidualLatentDecoderPerChannelAlpha, FullPredictor
 from bgp import const
 
 import matplotlib.pyplot as plt
@@ -277,7 +277,12 @@ if __name__ == "__main__":
         p.requires_grad = False
 
     # NEW decoder
-    cond_decoder = AgeResidualLatentDecoder(
+    # cond_decoder = AgeResidualLatentDecoder(
+    #     pretrained_ae=ae,
+    #     age_embed_dim=args.age_embed_dim,
+    #     hidden=64,   # or 32
+    # ).to(device)
+    cond_decoder = AgeResidualLatentDecoderPerChannelAlpha(
         pretrained_ae=ae,
         age_embed_dim=args.age_embed_dim,
         hidden=64,   # or 32

@@ -1,0 +1,459 @@
+import os
+import argparse
+import csv
+import wandb
+from datetime import datetime
+import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+import pandas as pd
+from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
+from monai import transforms
+from monai.utils import set_determinism
+from monai.data.image_reader import NumpyReader
+from generative.networks.schedulers import DDPMScheduler
+from generative.inferers import DiffusionInferer
+from tqdm import tqdm
+
+from bgp import const
+from bgp import utils
+from bgp import networks
+from bgp import (
+    get_dataset_from_pd,
+    sample_using_diffusion
+)
+
+
+set_determinism(0)
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+REGION_STATS = {
+    "cerebral_cortex": {
+        "min": 492847.0,
+        "max": 643476.0,
+        "mean": 593469.0744580585,
+        "std": 19582.035425722785,
+    },
+    "cerebral_white_matter": {
+        "min": 302852.0,
+        "max": 416938.0,
+        "mean": 354940.40999057493,
+        "std": 20604.86271047682,
+    },
+    "lateral_ventricle": {
+        "min": 2151.0,
+        "max": 38804.0,
+        "mean": 9872.593779453346,
+        "std": 3986.475748374291,
+    },
+}
+
+
+def minmax_norm(x: float, vmin: float, vmax: float) -> float:
+    return (x - vmin) / (vmax - vmin)
+
+
+def minmax_denorm(x_norm: float, vmin: float, vmax: float) -> float:
+    return x_norm * (vmax - vmin) + vmin
+
+
+def make_context(
+    age_norm: float,
+    sex: float,
+    cerebral_cortex: float,
+    cerebral_white_matter: float,
+    lateral_ventricle: float,
+    device: str = "cuda",
+    inputs_are_normalized: bool = True,
+) -> torch.Tensor:
+    """
+    Build context in the exact order of const.CONDITIONING_VARIABLES:
+    [age, sex, cerebral_cortex, cerebral_white_matter, lateral_ventricle]
+
+    age_norm must already be in [0,1].
+    sex is assumed 0 or 1.
+    Regional inputs can be either normalized already or raw volumes.
+    """
+
+    if not inputs_are_normalized:
+        cerebral_cortex = minmax_norm(
+            cerebral_cortex,
+            REGION_STATS["cerebral_cortex"]["min"],
+            REGION_STATS["cerebral_cortex"]["max"],
+        )
+        cerebral_white_matter = minmax_norm(
+            cerebral_white_matter,
+            REGION_STATS["cerebral_white_matter"]["min"],
+            REGION_STATS["cerebral_white_matter"]["max"],
+        )
+        lateral_ventricle = minmax_norm(
+            lateral_ventricle,
+            REGION_STATS["lateral_ventricle"]["min"],
+            REGION_STATS["lateral_ventricle"]["max"],
+        )
+
+    context = torch.tensor(
+        [[
+            float(age_norm),
+            float(sex),
+            float(cerebral_cortex),
+            float(cerebral_white_matter),
+            float(lateral_ventricle),
+        ]],
+        dtype=torch.float32,
+        device=device,
+    )
+    return context
+
+
+def concat_covariates(_dict):
+    """
+    Provide context for cross-attention layers and concatenate the
+    covariates in the channel dimension.
+    """
+    _dict['context'] = torch.tensor([ _dict[c] for c in const.CONDITIONING_VARIABLES ]).unsqueeze(0)
+    return _dict
+
+def make_orthogonal_montage(image: torch.Tensor) -> plt.Figure:
+    """
+    Given a 3D tensor (D,H,W), returns a matplotlib Figure
+    showing the three center slices (sagittal, coronal, axial).
+    """
+    # ensure image is CPU numpy for plotting
+    if image.ndim == 4 and image.shape[0] == 1:
+        image = image.squeeze(0)
+    D, H, W = image.shape
+
+    mids = [D//2, H//2, W//2]
+
+    plt.style.use('dark_background')
+    fig, axes = plt.subplots(ncols=3, figsize=(7, 3))
+    for ax in axes:
+        ax.axis('off')
+
+    axes[0].imshow(image[mids[0], :, :].cpu(), cmap='gray')
+    axes[1].imshow(image[:, mids[1], :].cpu(), cmap='gray')
+    axes[2].imshow(image[:, :, mids[2]].cpu(), cmap='gray')
+    plt.tight_layout()
+    return fig
+
+def images_to_wandb(
+    epoch: int,
+    mode: str,
+    autoencoder,
+    diffusion,
+    scale_factor: float,
+    device: str = "cuda",
+):
+    """
+    Sample 3 volumes using the same conditioning structure as training:
+    [age, sex, cerebral_cortex, cerebral_white_matter, lateral_ventricle]
+    """
+
+    logs = {}
+
+    # fixed reasonable tissue values around the dataset mean, normalized with min-max
+    cortex_mean_norm = minmax_norm(
+        REGION_STATS["cerebral_cortex"]["mean"],
+        REGION_STATS["cerebral_cortex"]["min"],
+        REGION_STATS["cerebral_cortex"]["max"],
+    )
+    wm_mean_norm = minmax_norm(
+        REGION_STATS["cerebral_white_matter"]["mean"],
+        REGION_STATS["cerebral_white_matter"]["min"],
+        REGION_STATS["cerebral_white_matter"]["max"],
+    )
+
+    # three ventricle settings: small / medium / large
+    vent_norm_values = [0.10, 0.30, 0.60]
+
+    for i in range(3):
+        age_norm = torch.rand(1, device=device).item()   # already [0,1]
+        sex = float(torch.randint(0, 2, (1,), device=device).item())
+
+        cortex_norm = cortex_mean_norm
+        wm_norm = wm_mean_norm
+        vent_norm = vent_norm_values[i]
+
+        context = make_context(
+            age_norm=age_norm,
+            sex=sex,
+            cerebral_cortex=cortex_norm,
+            cerebral_white_matter=wm_norm,
+            lateral_ventricle=vent_norm,
+            device=device,
+            inputs_are_normalized=True,
+        )
+
+        img = sample_using_diffusion(
+            autoencoder=autoencoder,
+            diffusion=diffusion,
+            context=context,
+            device=device,
+            scale_factor=scale_factor,
+            num_inference_steps=args.num_inf_steps,
+        )
+
+        fig = make_orthogonal_montage(img)
+
+        age_years = 1.0 + 6.0 * age_norm
+        vent_raw = minmax_denorm(
+            vent_norm,
+            REGION_STATS["lateral_ventricle"]["min"],
+            REGION_STATS["lateral_ventricle"]["max"],
+        )
+
+        caption = (
+            f"{mode} | age_norm={age_norm:.3f} (~{age_years:.2f}y) | "
+            f"sex={int(sex)} | "
+            f"ctx=[age={age_norm:.3f}, sex={int(sex)}, "
+            f"cortex={cortex_norm:.3f}, wm={wm_norm:.3f}, vent={vent_norm:.3f}] | "
+            f"vent≈{vent_raw:.0f}"
+        )
+
+        logs[f"{mode}/gen_{i}"] = wandb.Image(fig, caption=caption)
+        plt.close(fig)
+
+    wandb.log(logs)
+
+
+if __name__ == '__main__':
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_csv',  required=True, type=str)
+    parser.add_argument('--cache_dir',  required=True, type=str)
+    parser.add_argument('--output_dir', required=True, type=str)
+    parser.add_argument('--aekl_ckpt',  required=True, type=str)
+    parser.add_argument('--diff_ckpt',   default=None, type=str)
+    parser.add_argument('--num_workers', default=8,     type=int)
+    parser.add_argument('--n_epochs',    default=5,     type=int)
+    parser.add_argument('--batch_size',  default=16,    type=int)
+    parser.add_argument('--lr',          default=2.5e-5,  type=float)
+    parser.add_argument('--patience', type=int, default=15, help="number of epochs with no val‑loss improvement before stopping")
+    parser.add_argument('--min_epochs', type=int, default=200,
+    help="don’t start early‐stopping until you’ve run this many epochs")
+    parser.add_argument('--num_inf_steps', type=int, default=50, help="Number of inference steps for DDIM sampler at inference time")
+    args = parser.parse_args()
+
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+
+    # wandb.init(
+    # project="ldm-age-prediction",
+    # config=vars(args),      # logs all CLI args as hyperparameters
+    # mode="offline",         # records locally; you can later `wandb sync`
+    # dir=args.output_dir     # where to write the wandb files
+    # )
+    wandb.init(
+    project="diffusion-unet-model",
+    name=f"{run_name}",
+    config=vars(args),      # logs all CLI args as hyperparameters
+    mode="online",         # records locally; you can later `wandb sync`
+    dir=args.output_dir     # where to write the wandb files
+    )
+    
+    npz_reader = NumpyReader(npz_keys=['data'])
+    transforms_fn = transforms.Compose([
+        transforms.CopyItemsD(keys=['latent_path'], names=['latent']),
+        transforms.LoadImageD(keys=['latent'], reader=npz_reader),
+        transforms.EnsureChannelFirstD(keys=['latent'], channel_dim=0), 
+        transforms.DivisiblePadD(keys=['latent'], k=4, mode='constant'),
+        transforms.Lambda(func=concat_covariates)
+    ])
+
+    dataset_df = pd.read_csv(args.dataset_csv)
+    # train_df = dataset_df[ dataset_df.split == 'train' ]
+    # valid_df = dataset_df[ dataset_df.split == 'valid' ]
+    dataset_df["split"] = pd.to_numeric(dataset_df["split"], errors="coerce")
+
+    train_df = dataset_df[dataset_df["split"] < 5].copy()
+    valid_df = dataset_df[dataset_df["split"] == 5].copy()
+    print("Train splits:", sorted(train_df["split"].dropna().unique()))
+    print("Valid splits:", sorted(valid_df["split"].dropna().unique()))
+    print("Train n:", len(train_df))
+    print("Valid n:", len(valid_df))
+    trainset = get_dataset_from_pd(train_df, transforms_fn)
+    validset = get_dataset_from_pd(valid_df, transforms_fn)
+
+    train_loader = DataLoader(dataset=trainset, 
+                              num_workers=args.num_workers, 
+                              batch_size=args.batch_size, 
+                              shuffle=True, 
+                              persistent_workers=True,
+                              pin_memory=True)
+    
+    valid_loader = DataLoader(dataset=validset, 
+                              num_workers=args.num_workers, 
+                              batch_size=args.batch_size, 
+                              shuffle=False, 
+                              persistent_workers=True, 
+                              pin_memory=True)
+    
+    autoencoder = networks.init_autoencoder(args.aekl_ckpt).to(DEVICE)
+    diffusion = networks.init_latent_diffusion(args.diff_ckpt).to(DEVICE)
+    
+    scheduler = DDPMScheduler(
+        num_train_timesteps=1000, 
+        schedule='scaled_linear_beta', 
+        beta_start=0.0015, 
+        beta_end=0.0205
+    )
+
+    inferer = DiffusionInferer(scheduler=scheduler)
+    optimizer = torch.optim.AdamW(diffusion.parameters(), lr=args.lr)
+    scaler = GradScaler()
+    
+    with torch.no_grad():
+        with autocast(enabled=True):
+            z = trainset[0]['latent']
+    print(f"Latent shape: {z.shape}")
+
+    scale_factor = 1 / torch.std(z)
+    print(f"Scaling factor set to {scale_factor}")
+
+
+    # Define W&B metrics once
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/epoch_mse", step_metric="epoch")
+    wandb.define_metric("valid/epoch_mse", step_metric="epoch")
+
+    wandb.define_metric("train/global_step")
+    wandb.define_metric("valid/global_step")
+    wandb.define_metric("train/batch_mse", step_metric="train/global_step")
+    wandb.define_metric("valid/batch_mse", step_metric="valid/global_step")
+
+    global_counter = {"train": 0, "valid": 0}
+    loaders = {"train": train_loader, "valid": valid_loader}
+
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    patience = args.patience
+    min_epochs = args.min_epochs
+    all_losses = []
+
+    for epoch in range(args.n_epochs):
+        epoch_losses = {}
+        epoch_steps = {}
+
+        for mode in ["train", "valid"]:
+            loader = loaders[mode]
+
+            if mode == "train":
+                diffusion.train()
+            else:
+                diffusion.eval()
+
+            running_loss = 0.0
+            progress_bar = tqdm(loader, total=len(loader), desc=f"Epoch {epoch} [{mode}]")
+
+            for step, batch in enumerate(progress_bar):
+                if mode == "train":
+                    optimizer.zero_grad(set_to_none=True)
+
+                latents = batch["latent"].to(DEVICE) * scale_factor
+                context = batch["context"].to(DEVICE)
+                n = latents.shape[0]
+
+                with torch.set_grad_enabled(mode == "train"):
+                    with autocast(enabled=True):
+                        noise = torch.randn_like(latents)
+                        timesteps = torch.randint(
+                            0,
+                            scheduler.num_train_timesteps,
+                            (n,),
+                            device=DEVICE
+                        ).long()
+
+                        noise_pred = inferer(
+                            inputs=latents,
+                            diffusion_model=diffusion,
+                            noise=noise,
+                            timesteps=timesteps,
+                            condition=context,
+                            mode="crossattn",
+                        )
+
+                        loss = F.mse_loss(noise.float(), noise_pred.float())
+
+                if mode == "train":
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                batch_loss = loss.item()
+                running_loss += batch_loss
+                avg_loss = running_loss / (step + 1)
+
+                wandb.log({
+                    f"{mode}/global_step": global_counter[mode],
+                    f"{mode}/batch_mse": batch_loss,
+                })
+
+                progress_bar.set_postfix({
+                    "batch_loss": f"{batch_loss:.5f}",
+                    "avg_loss": f"{avg_loss:.5f}",
+                })
+
+                global_counter[mode] += 1
+
+            epoch_loss = running_loss / len(loader)
+            epoch_losses[mode] = epoch_loss
+            epoch_steps[mode] = len(loader)
+
+            wandb.log({
+                "epoch": epoch,
+                f"{mode}/epoch_mse": epoch_loss,
+            })
+
+            images_to_wandb(
+                epoch=epoch,
+                mode=mode,
+                autoencoder=autoencoder,
+                diffusion=diffusion,
+                scale_factor=scale_factor,
+                device=DEVICE,
+            )
+
+        train_loss = epoch_losses["train"]
+        val_loss = epoch_losses["valid"]
+
+        print(
+            f"[Epoch {epoch}] "
+            f"train_mse={train_loss:.6f} | "
+            f"valid_mse={val_loss:.6f}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+
+            best_path = os.path.join(args.output_dir, "best-unet.pth")
+            torch.save(diffusion.state_dict(), best_path)
+            print(f"[Epoch {epoch}] New best val loss: {val_loss:.6f} -> saved to {best_path}")
+        else:
+            if epoch >= min_epochs:
+                epochs_no_improve += 1
+                print(f"[Epoch {epoch}] No improvement: {epochs_no_improve}/{patience}")
+
+        all_losses.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_steps": epoch_steps["train"],
+            "valid_loss": val_loss,
+            "valid_steps": epoch_steps["valid"],
+            "best_val_loss_so_far": best_val_loss,
+        })
+
+        savepath = os.path.join(args.output_dir, f"unet-ep-{epoch}.pth")
+        torch.save(diffusion.state_dict(), savepath)
+
+        csv_path = os.path.join(args.output_dir, "epoch_losses.csv")
+        df_losses = pd.DataFrame(all_losses)
+        df_losses.to_csv(csv_path, index=False)
+
+        if epoch >= min_epochs and epochs_no_improve >= patience:
+            print(f"Stopping early at epoch {epoch}. Best val loss: {best_val_loss:.6f}")
+            break
+
+    wandb.finish()

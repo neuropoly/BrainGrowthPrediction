@@ -59,22 +59,34 @@ COARSE_REGIONS = [
     "ventral_dc",
 ]
 
+CONDITIONING_VARIABLES = [
+    "age", 
+    "sex",
+    # "diagnosis",
+    "cerebral_cortex", 
+    # "hippocampus", 
+    # "amygdala",
+    "cerebral_white_matter",
+    "lateral_ventricle", 
+]
+
 # chosen resolution
 RESOLUTION = 1.3                             
 
 # shape of the MNI152 (1mm^3) template
 # INPUT_SHAPE_1mm = (182, 218, 182)   
 # for ANTS 0-8
-# INPUT_SHAPE_1mm = (135, 177, 138)   
+INPUT_SHAPE_1mm = (135, 177, 138)   
 # for MNI 4.5-8.5
-INPUT_SHAPE_1mm = (197, 233, 189)   
+# INPUT_SHAPE_1mm = (197, 233, 189)   
 
 # resampling the MNI152 to (1.5mm^3)
 # INPUT_SHAPE_1p5mm = (122, 146, 122) 
 # resampling the template to (1.3mm^3) for ANTS 0-8
 # INPUT_SHAPE_1p5mm = (104, 136, 106)   
+# INPUT_SHAPE_1p5mm = (104, 136, 106) 
 # resampling the template to (1.3mm^3) for MNI 4.5-8.5
-INPUT_SHAPE_1p5mm = (152, 179, 146)   
+# INPUT_SHAPE_1p5mm = (152, 179, 146)   
 
 # Adjusting the dimensions to be divisible by 8 (2^3 where 3 are the downsampling layers of the AE)
 # INPUT_SHAPE_AE = (120, 144, 120)  

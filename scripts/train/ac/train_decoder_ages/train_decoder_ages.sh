@@ -4,7 +4,7 @@
 #SBATCH --gpus=h100:1                 # Full H100-80GB GPU
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=25G
-#SBATCH --time=00-60:00
+#SBATCH --time=00-15:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --account=def-bedelb
@@ -33,20 +33,20 @@ echo "[info] fold=$FOLD uses ckpt=$AEKL_CKPT"
 
 # Base dirs
 BASE=$HOME/scratch/bgp
-OUT_ROOT=ae_decoder_ages_output_new_autoencoder
+OUT_ROOT=ae_decoder_ages_output_new_ae_exp2
 OUT_DIR=${BASE}/${OUT_ROOT}/fold_${FOLD}
 mkdir -p "$OUT_DIR"
 
 python /home/andim/BrainGrowthPrediction/scripts/train/train_decoder_ages.py \
   --dataset_csv   $HOME/projects/def-bedelb/andim/brlp-data/datasets_complete_pred_pairs_with_cv_splits.csv \
-  --n_epochs      500 \
+  --n_epochs      150 \
   --max_batch_size 3 \
   --batch_size    27 \
   --min_epochs 50 \
   --adv_weight 0 \
   --early_stop_patience 100 \
   --early_stop_delta 0.00015 \
-  --decoder_k_blocks_to_unfreeze 6 \
+  --decoder_k_blocks_to_unfreeze 0 \
   --plateau_factor 0.5 \
   --plateau_patience 12 \
   --plateau_cooldown 6 \
