@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
 import wandb
 
@@ -208,7 +209,7 @@ class CVAE(nn.Module):
       - no disease status
     """
 
-    def __init__(self, latent_dim=32, cond_dim=2, base=64):
+    def __init__(self, latent_dim=32, hidden_dim=256, cond_dim=2, base=64):
         super().__init__()
 
         kernel_size = (3, 3, 3)
@@ -224,7 +225,7 @@ class CVAE(nn.Module):
         self.latent_dim = latent_dim
         self.cond_dim = cond_dim
         self.decoder_scalar_dim = latent_dim + cond_dim
-        self.hidden_dim = 256
+        self.hidden_dim = hidden_dim
 
         self.e1 = Conv(2, base, kernel_size, stride_size, padding_size, scalar_size=cond_dim)
         self.e2 = Conv(base, base, kernel_size, stride_size, padding_size, scalar_size=cond_dim)
@@ -545,8 +546,8 @@ def log_forecast_grid(
     base_image_path,
     base_age_months,
     year_horizon,
-    age1_mean,
-    age1_std,
+    age0_mean,
+    age0_std,
     dt_mean,
     dt_std,
     resolution,
@@ -722,6 +723,7 @@ def main():
     parser.add_argument("--lr", default=1e-5, type=float)
 
     parser.add_argument("--latent_dim", default=10, type=int)
+    parser.add_argument("--hidden_dim", default=256, type=int)
     parser.add_argument("--base_channels", default=64, type=int)
 
     parser.add_argument("--resolution", nargs=3, type=float, default=[1.0, 1.0, 1.0])
@@ -847,10 +849,16 @@ def main():
         collate_fn=collate_longitudinal,
     )
 
+    # model = CVAE(
+    #     latent_dim=args.latent_dim,
+    #     cond_dim=2,
+    #     base=args.base_channels,
+    # ).to(device)
     model = CVAE(
         latent_dim=args.latent_dim,
         cond_dim=2,
         base=args.base_channels,
+        hidden_dim=args.hidden_dim,
     ).to(device)
 
     print("parameter count:", parameter_count(model))
@@ -973,8 +981,8 @@ def main():
                 base_image_path=args.forecast_base_image,
                 base_age_months=args.forecast_base_age_m,
                 year_horizon=args.forecast_years,
-                age1_mean=age1_mean,
-                age1_std=age1_std,
+                age0_mean=age0_mean,
+                age0_std=age0_std,
                 dt_mean=dt_mean,
                 dt_std=dt_std,
                 resolution=tuple(args.resolution),
