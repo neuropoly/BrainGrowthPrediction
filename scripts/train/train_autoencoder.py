@@ -44,6 +44,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # PersistentDataset cache files (they contain MetaTensor objects). The cache files are
 # written by this script itself, so loading them with weights_only=False is safe.
 import functools
+import uuid
 torch.load = functools.partial(torch.load, weights_only=False)
 
 
@@ -152,12 +153,14 @@ def no_aug():
 # Validation (always clean input -> clean target)
 # ---------------------------------------------------------------------------
 def run_validation(autoencoder, discriminator, val_loader, args,
-                   l1_loss_fn, kl_loss_fn, perc_loss_fn, adv_loss_fn):
+                   l1_loss_fn, kl_loss_fn, perc_loss_fn, adv_loss_fn, max_batches=0):
     autoencoder.eval()
     discriminator.eval()
     sums, n = defaultdict(float), 0
     with torch.no_grad():
-        for batch in val_loader:
+        for b_idx, batch in enumerate(val_loader):
+            if max_batches and b_idx >= max_batches:
+                break
             with autocast(enabled=True):
                 images = batch["image"].to(DEVICE)
                 reconstruction, z_mu, z_sigma = autoencoder(images)
@@ -225,6 +228,10 @@ if __name__ == '__main__':
     parser.add_argument('--save_every',        default=50, type=int, help="periodic checkpoint every N epochs")
     parser.add_argument('--log_scalars_every', default=50, type=int)
     parser.add_argument('--log_img_every',     default=500, type=int)
+    parser.add_argument('--resume',            action='store_true',
+                        help="continue from <output_dir>/state-last.pt if it exists (otherwise start fresh)")
+    parser.add_argument('--debug_steps',       default=0, type=int,
+                        help="debug only: stop each epoch (train and val) after this many batches")
     args = parser.parse_args()
 
     set_determinism(args.seed)
@@ -234,10 +241,26 @@ if __name__ == '__main__':
     if args.cache_dir:
         os.makedirs(args.cache_dir, exist_ok=True)   # bgp.get_dataset_from_pd asserts it already exists
 
-    run_name = f"{args.arm}_s{args.seed}" + ("_pre" if args.aekl_ckpt else "") + \
-               datetime.now().strftime("_%Y%m%d_%H%M%S")
+    state_path = os.path.join(args.output_dir, "state-last.pt")
+    run_id_path = os.path.join(args.output_dir, "wandb_run_id.txt")
+    done_path = os.path.join(args.output_dir, "DONE")
+    if args.resume and os.path.exists(done_path):
+        print(f"[resume] {done_path} exists: this run early-stopped. Delete it to train further.")
+        raise SystemExit(0)
+    resuming = args.resume and os.path.exists(state_path)
+    if args.resume and not resuming:
+        print(f"[resume] no {state_path} found -> starting a fresh run")
+
+    if resuming and os.path.exists(run_id_path):
+        run_id, run_name = open(run_id_path).read().split()
+    else:
+        run_id = uuid.uuid4().hex[:8]   # wandb run ids: lowercase letters and digits
+        run_name = f"{args.arm}_s{args.seed}" + ("_pre" if args.aekl_ckpt else "") + \
+                   datetime.now().strftime("_%Y%m%d_%H%M%S")
+        with open(run_id_path, "w") as f:
+            f.write(f"{run_id} {run_name}")
     wandb.init(project=args.wandb_project_name, config=vars(args), mode=args.wandb_mode,
-               name=run_name, dir=args.output_dir)
+               name=run_name, dir=args.output_dir, id=run_id, resume="allow")
     wandb.define_metric("epoch")
     wandb.define_metric("Val/*", step_metric="epoch")
 
@@ -258,12 +281,13 @@ if __name__ == '__main__':
     trainset = get_dataset_from_pd(ae_train_df, train_tf, args.cache_dir)
     valset = get_dataset_from_pd(ae_val_df, val_tf, args.cache_dir)
 
+    sampler_gen = None
     if args.sample_weight == "none":
         sampler = None
     else:
         w = torch.as_tensor(ae_train_df[args.sample_weight].values, dtype=torch.double)
-        sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True,
-                                        generator=torch.Generator().manual_seed(args.seed))
+        sampler_gen = torch.Generator().manual_seed(args.seed)
+        sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True, generator=sampler_gen)
 
     train_loader = DataLoader(trainset, batch_size=args.max_batch_size, shuffle=(sampler is None), sampler=sampler,
                               num_workers=args.num_workers, persistent_workers=args.num_workers > 0, pin_memory=True)
@@ -291,10 +315,12 @@ if __name__ == '__main__':
     g_params = list(autoencoder.parameters()) + (list(site_head.parameters()) if site_head else [])
     optimizer_g = torch.optim.Adam(g_params, lr=args.lr)
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=args.lr)
+    scaler_g, scaler_d = GradScaler(), GradScaler()
+    loader_len = min(len(train_loader), args.debug_steps) if args.debug_steps else len(train_loader)
     gradacc_g = GradientAccumulation(actual_batch_size=args.max_batch_size, expect_batch_size=args.batch_size,
-                                     loader_len=len(train_loader), optimizer=optimizer_g, grad_scaler=GradScaler())
+                                     loader_len=loader_len, optimizer=optimizer_g, grad_scaler=scaler_g)
     gradacc_d = GradientAccumulation(actual_batch_size=args.max_batch_size, expect_batch_size=args.batch_size,
-                                     loader_len=len(train_loader), optimizer=optimizer_d, grad_scaler=GradScaler())
+                                     loader_len=loader_len, optimizer=optimizer_d, grad_scaler=scaler_d)
 
     avgloss = utils.AverageLoss()
     total_counter = 0
@@ -309,20 +335,71 @@ if __name__ == '__main__':
         if site_head is not None:
             torch.save(site_head.state_dict(), os.path.join(args.output_dir, f"site_head-{tag}.pth"))
 
-    for epoch in range(args.n_epochs):
+    def save_state(epoch):
+        """Everything needed to continue training exactly where this epoch ended."""
+        state = {
+            "epoch": epoch, "total_counter": total_counter,
+            "best_loss": best_loss, "best_ssim": best_ssim,
+            "autoencoder": autoencoder.state_dict(), "discriminator": discriminator.state_dict(),
+            "site_head": site_head.state_dict() if site_head is not None else None,
+            "optimizer_g": optimizer_g.state_dict(), "optimizer_d": optimizer_d.state_dict(),
+            "scaler_g": scaler_g.state_dict(), "scaler_d": scaler_d.state_dict(),
+            "sampler_gen": sampler_gen.get_state() if sampler_gen is not None else None,
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "args": vars(args),
+        }
+        tmp = state_path + ".tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, state_path)   # atomic: a job killed mid-save never corrupts state-last.pt
+
+    start_epoch = 0
+    if resuming:
+        # load on CPU: RNG states must stay CPU ByteTensors; load_state_dict copies weights and
+        # optimizer states onto the GPU parameters itself
+        st = torch.load(state_path, map_location="cpu")
+        if st["args"]["arm"] != args.arm:
+            raise ValueError(f"state was saved for arm={st['args']['arm']}, not {args.arm}")
+        autoencoder.load_state_dict(st["autoencoder"])
+        discriminator.load_state_dict(st["discriminator"])
+        if site_head is not None:
+            site_head.load_state_dict(st["site_head"])
+        optimizer_g.load_state_dict(st["optimizer_g"])
+        optimizer_d.load_state_dict(st["optimizer_d"])
+        scaler_g.load_state_dict(st["scaler_g"])
+        scaler_d.load_state_dict(st["scaler_d"])
+        if sampler_gen is not None and st["sampler_gen"] is not None:
+            sampler_gen.set_state(st["sampler_gen"].cpu())
+        torch.set_rng_state(st["torch_rng"].cpu())
+        if st["cuda_rng"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([r.cpu() for r in st["cuda_rng"]])
+        total_counter, best_loss, best_ssim = st["total_counter"], st["best_loss"], st["best_ssim"]
+        # a resumed W&B run continues at (last logged step + 1); start there so the first
+        # training log after resuming isn't rejected as "step less than current step"
+        if wandb.run is not None and wandb.run.step:
+            total_counter = max(total_counter, wandb.run.step)
+        start_epoch = st["epoch"] + 1
+        print(f"[resume] loaded {state_path}: finished epoch {st['epoch']}, continuing at epoch {start_epoch} "
+              f"(step {total_counter}, best-loss ep={best_loss['epoch']}, best-ssim ep={best_ssim['epoch']})")
+        if start_epoch >= args.n_epochs:
+            print("[resume] n_epochs already reached; nothing to do")
+
+    for epoch in range(start_epoch, args.n_epochs):
         autoencoder.train()
         if site_head is not None:
             site_head.train()
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f'Epoch {epoch}')
 
         for it, batch in progress_bar:
+            if args.debug_steps and it >= args.debug_steps:
+                break
             with autocast(enabled=True):
                 inputs = batch["image_in"].to(DEVICE)   # augmented (aug arms) or identical to target
                 targets = batch["image"].to(DEVICE)     # always the clean image
                 reconstruction, z_mu, z_sigma = autoencoder(inputs)
                 logits_fake = discriminator(reconstruction.contiguous().float())[-1]
 
-                if epoch == 0 and it == 0:
+                if epoch == start_epoch and it == 0:
                     print('images:', inputs.shape, '| recon:', reconstruction.shape, '| z_mu:', z_mu.shape)
 
                 rec_loss = l1_loss_fn(reconstruction.float(), targets.float())
@@ -365,7 +442,8 @@ if __name__ == '__main__':
 
         # ---------------- validation / checkpoints ----------------
         val_metrics = run_validation(autoencoder, discriminator, val_loader, args,
-                                     l1_loss_fn, kl_loss_fn, perc_loss_fn, adv_loss_fn)
+                                     l1_loss_fn, kl_loss_fn, perc_loss_fn, adv_loss_fn,
+                                     max_batches=args.debug_steps)
         score, ssim, klraw = (val_metrics["Val/Generator/total_loss"], val_metrics["Val/SSIM"],
                               val_metrics["Val/Generator/kl_raw"])
         eligible = klraw >= args.min_kl_raw
@@ -393,11 +471,15 @@ if __name__ == '__main__':
 
         # last checkpoint (overwritten) + sparse periodic ones instead of 600 files
         save("last")
+        save_state(epoch)
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             save(f"ep-{epoch}")
 
         if args.patience > 0 and best_loss["epoch"] >= 0 and epoch - best_loss["epoch"] >= args.patience:
             print(f"Early stopping at epoch {epoch}: no best-loss improvement for {args.patience} epochs")
+            # mark as finished so a resubmitted job doesn't keep training past early stopping
+            with open(done_path, "w") as f:
+                f.write(f"early-stopped at epoch {epoch} (best-loss epoch {best_loss['epoch']})\n")
             break
 
     wandb.finish()
