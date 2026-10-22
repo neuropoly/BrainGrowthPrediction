@@ -40,6 +40,12 @@ from bgp import (
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# PyTorch >= 2.6 defaults torch.load(weights_only=True), which can't read MONAI's
+# PersistentDataset cache files (they contain MetaTensor objects). The cache files are
+# written by this script itself, so loading them with weights_only=False is safe.
+import functools
+torch.load = functools.partial(torch.load, weights_only=False)
+
 
 # ---------------------------------------------------------------------------
 # Logging / metrics
@@ -225,6 +231,8 @@ if __name__ == '__main__':
     use_aug = args.arm in ('aug', 'aug_adv')
     use_adv = args.arm in ('adv', 'aug_adv')
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.cache_dir:
+        os.makedirs(args.cache_dir, exist_ok=True)   # bgp.get_dataset_from_pd asserts it already exists
 
     run_name = f"{args.arm}_s{args.seed}" + ("_pre" if args.aekl_ckpt else "") + \
                datetime.now().strftime("_%Y%m%d_%H%M%S")
@@ -258,9 +266,9 @@ if __name__ == '__main__':
                                         generator=torch.Generator().manual_seed(args.seed))
 
     train_loader = DataLoader(trainset, batch_size=args.max_batch_size, shuffle=(sampler is None), sampler=sampler,
-                              num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+                              num_workers=args.num_workers, persistent_workers=args.num_workers > 0, pin_memory=True)
     val_loader = DataLoader(valset, batch_size=args.max_batch_size, shuffle=False,
-                            num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+                            num_workers=args.num_workers, persistent_workers=args.num_workers > 0, pin_memory=True)
 
     # ---------------- models ----------------
     autoencoder = init_autoencoder(args.aekl_ckpt).to(DEVICE)
