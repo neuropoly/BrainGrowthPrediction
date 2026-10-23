@@ -44,6 +44,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # PersistentDataset cache files (they contain MetaTensor objects). The cache files are
 # written by this script itself, so loading them with weights_only=False is safe.
 import functools
+import time
 import uuid
 torch.load = functools.partial(torch.load, weights_only=False)
 
@@ -83,6 +84,33 @@ def batch_ssim_scalar(y_pred, y_true, data_range=1.0):
         data_range=data_range, kernel_type=KernelType.GAUSSIAN, k1=0.01, k2=0.03,
     )
     return ssim_full.view(ssim_full.shape[0], -1).mean(dim=1).mean()
+
+
+# ---------------------------------------------------------------------------
+# Shared-cache safety
+# ---------------------------------------------------------------------------
+class RetryCacheReads(torch.utils.data.Dataset):
+    """
+    Several jobs share one MONAI cache folder. While one job is still copying a cache
+    file onto scratch, another job can read it half-written ("failed finding central
+    directory"). The copy finishes within seconds, so wait and read again.
+    """
+    def __init__(self, ds, retries=6, wait=5.0):
+        self.ds, self.retries, self.wait = ds, retries, wait
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        for attempt in range(self.retries):
+            try:
+                return self.ds[idx]
+            except (RuntimeError, EOFError) as e:
+                if attempt == self.retries - 1:
+                    raise
+                print(f"[cache] read of item {idx} failed ({str(e).splitlines()[0][:80]}); "
+                      f"retry {attempt + 1}/{self.retries - 1} in {self.wait:.0f}s", flush=True)
+                time.sleep(self.wait)
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +306,8 @@ if __name__ == '__main__':
 
     train_tf = transforms.Compose(base_transforms() + (site_augmentations(args.aug_p) if use_aug else no_aug()))
     val_tf = transforms.Compose(base_transforms())
-    trainset = get_dataset_from_pd(ae_train_df, train_tf, args.cache_dir)
-    valset = get_dataset_from_pd(ae_val_df, val_tf, args.cache_dir)
+    trainset = RetryCacheReads(get_dataset_from_pd(ae_train_df, train_tf, args.cache_dir))
+    valset = RetryCacheReads(get_dataset_from_pd(ae_val_df, val_tf, args.cache_dir))
 
     sampler_gen = None
     if args.sample_weight == "none":

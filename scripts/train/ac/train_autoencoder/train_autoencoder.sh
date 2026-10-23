@@ -4,7 +4,7 @@
 #SBATCH --gpus=h100:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=25G
-#SBATCH --time=3-00:00
+#SBATCH --time=00-45:00
 #SBATCH --account=def-bedelb
 #SBATCH --output=logs/ae_arms_%A_%a.out
 #SBATCH --error=logs/ae_arms_%A_%a.err
