@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=ae_eval
-#SBATCH --gpus=h100:1
+#SBATCH --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=0-04:00
+#SBATCH --mem=15G
+#SBATCH --time=0-15:00
 #SBATCH --account=def-bedelb
-#SBATCH --output=/home/andim/scratch/bgp/logs/ae_eval_%j.out
-#SBATCH --error=/home/andim/scratch/bgp/logs/ae_eval_%j.err
+#SBATCH --output=logs/ae_eval_%j.out
+#SBATCH --error=logs/ae_eval_%j.err
 #SBATCH --export=ALL,DISABLE_DCGM=1
 set -euo pipefail
 
@@ -19,7 +19,7 @@ CSV=/home/andim/projects/def-bedelb/andim/brlp-data/splits/datasets_splits.csv
 PRE=/home/andim/projects/def-bedelb/andim/all-checkpoints/ae_output/frozen_pre_trained/autoencoder_chekpoint_pretrained.pth
 OUT=$HOME/scratch/bgp/eval_all8
 
-python /home/andim/BrainGrowthPrediction/scripts/eval/eval_autoencoder.py \
+python /home/andim/BrainGrowthPrediction/scripts/evaluate/eval_autoencoder.py \
   --dataset_csv "$CSV" \
   --out_dir "$OUT" \
   --cache_dir $HOME/scratch/bgp/ae_cache \
