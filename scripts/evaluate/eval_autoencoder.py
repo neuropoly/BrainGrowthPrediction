@@ -27,7 +27,9 @@ import argparse
 import warnings
 warnings.filterwarnings("ignore", module="sklearn")
 import functools
+import gzip
 import json
+import pickle
 import os
 from pathlib import Path
 
@@ -62,7 +64,22 @@ def encode_all(args, df):
         transforms.ResizeWithPadOrCropD(spatial_size=const.INPUT_SHAPE_AE, mode='minimum', keys=['image']),
         transforms.ScaleIntensityD(minv=0, maxv=1, keys=['image']),
     ])
-    rows = df[["image_uid", "image_path"]].reset_index(drop=True)
+    out = Path(args.out_dir)
+    progress_path = out / "encode_progress.pkl"
+    uids = df["image_uid"].tolist()
+
+    # ---- resume: continue after the last saved scan of an interrupted run ----
+    latents, metrics, manifest, start = {n: [] for n in args.runs}, [], [], 0
+    if progress_path.exists():
+        with open(progress_path, "rb") as f:
+            prog = pickle.load(f)
+        if prog["uids"] == uids and prog["runs"] == list(args.runs) and prog["metric_roles"] == args.metric_roles:
+            latents, metrics, manifest, start = prog["latents"], prog["metrics"], prog["manifest"], prog["done"]
+            print(f"[resume] {start}/{len(uids)} scans already encoded; continuing")
+        else:
+            print("[resume] progress file is from different scans/runs/settings -> starting over")
+
+    rows = df[["image_uid", "image_path"]].iloc[start:].reset_index(drop=True)
     ds = get_dataset_from_pd(rows, tf, args.cache_dir)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
 
@@ -76,11 +93,10 @@ def encode_all(args, df):
         models[name] = init_autoencoder(ckpt).to(device).eval()
         print(f"[load] {name}: {ckpt}")
 
-    out = Path(args.out_dir)
     save_roles = set(args.save_recon_roles or [])
+    metric_roles = set(args.metric_roles)
     save_runs = set(args.save_recon_runs or models)
     recon_dir = out / "recon_nifti"
-    manifest = []
 
     def ssim3d(a, b):
         s, _ = compute_ssim_and_cs(y_pred=a, y=b, spatial_dims=3, kernel_size=(11, 11, 11),
@@ -88,17 +104,40 @@ def encode_all(args, df):
                                    kernel_type=KernelType.GAUSSIAN, k1=0.01, k2=0.03)
         return s.mean().item()
 
-    def write_nifti(vol, affine, path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        nib.save(nib.Nifti1Image(vol.squeeze().cpu().numpy().astype(np.float32), affine), str(path))
+    def nifti_ok(path):
+        """True if the file exists and decompresses fully (a job killed mid-write leaves a broken .gz)."""
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+        try:
+            with gzip.open(path, "rb") as f:
+                while f.read(1 << 24):
+                    pass
+            return True
+        except (OSError, EOFError):
+            return False
 
-    latents = {n: [] for n in models}
-    metrics = []
+    def write_nifti(vol, affine, path):
+        if nifti_ok(path):          # already written by an earlier (interrupted) run
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp.nii.gz")
+        nib.save(nib.Nifti1Image(vol.squeeze().cpu().numpy().astype(np.float32), affine), str(tmp))
+        os.replace(tmp, path)
+
+    def save_progress(done):
+        tmp = progress_path.with_suffix(".tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump({"uids": uids, "runs": list(args.runs), "metric_roles": args.metric_roles,
+                         "done": done, "latents": latents, "metrics": metrics, "manifest": manifest}, f)
+        os.replace(tmp, progress_path)
+
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(loader, desc="encode")):
+        for j, batch in enumerate(tqdm(loader, desc="encode", initial=start, total=len(uids))):
+            i = start + j
             x = batch["image"].to(device).float()
             row = df.iloc[i]
             save_this = row["role"] in save_roles
+            need_recon = save_this or row["role"] in metric_roles
             if save_this:
                 aff = getattr(batch["image"], "affine", None)
                 affine = (aff[0] if aff is not None and aff.ndim == 3 else aff)
@@ -111,16 +150,20 @@ def encode_all(args, df):
                 with torch.autocast("cuda", enabled=device == "cuda"):
                     if hasattr(m, "encode") and hasattr(m, "decode"):
                         z_mu, _ = m.encode(x)
-                        rec = m.decode(z_mu)          # deterministic: no sampling
+                        rec = m.decode(z_mu) if need_recon else None   # deterministic: no sampling
                     else:
                         rec, z_mu, _ = m(x)
-                rec, z_mu = rec.float().clamp(0, 1), z_mu.float()
-                mse = torch.mean((rec - x) ** 2).item()
-                metrics.append({"row": i, "arm": name,
-                                "l1": torch.mean(torch.abs(rec - x)).item(),
-                                "psnr": 10 * np.log10(1.0 / max(mse, 1e-12)),
-                                "ssim": ssim3d(rec, x)})
+                z_mu = z_mu.float()
                 latents[name].append(z_mu.cpu().numpy().reshape(-1).astype(np.float16))
+                if not need_recon:          # training scans: only the latent is needed
+                    continue
+                rec = rec.float().clamp(0, 1)
+                if row["role"] in metric_roles:
+                    mse = torch.mean((rec - x) ** 2).item()
+                    metrics.append({"row": i, "arm": name,
+                                    "l1": torch.mean(torch.abs(rec - x)).item(),
+                                    "psnr": 10 * np.log10(1.0 / max(mse, 1e-12)),
+                                    "ssim": ssim3d(rec, x)})
 
                 if save_this and name in save_runs:
                     rec_path = recon_dir / name / f"{row['image_uid']}.nii.gz"
@@ -128,6 +171,9 @@ def encode_all(args, df):
                     manifest.append({"image_uid": row["image_uid"], "dataset": row["dataset"],
                                      "subject_id": row["subject_id"], "role": row["role"], "arm": name,
                                      "input_path": str(in_path), "recon_path": str(rec_path)})
+
+            if args.progress_every and (i + 1) % args.progress_every == 0:
+                save_progress(i + 1)
 
     for name, z in latents.items():
         np.save(out / f"latents_{name}.npy", np.stack(z))
@@ -139,6 +185,8 @@ def encode_all(args, df):
         pd.DataFrame(manifest).to_csv(out / "recon_manifest.csv", index=False)
         print(f"[encode] wrote {len(manifest)} reconstructions to {recon_dir} (list: recon_manifest.csv)")
     print(f"[encode] wrote latents and {len(met)} metric rows to {out}")
+    if progress_path.exists():
+        progress_path.unlink()      # finished: the final files replace the progress file
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +436,10 @@ if __name__ == "__main__":
                     help="write input + reconstruction NIfTIs for these roles, e.g. test external_tbi")
     ap.add_argument("--save_recon_runs", nargs="*", default=None,
                     help="only write reconstructions for these runs (default: all)")
+    ap.add_argument("--metric_roles", nargs="*", default=["val", "test", "external_tbi"],
+                    help="roles that get reconstruction metrics (train scans are only encoded)")
+    ap.add_argument("--progress_every", default=100, type=int,
+                    help="save progress every N scans so an interrupted run can resume (0 = off)")
     ap.add_argument("--no_plots", action="store_true")
     ap.add_argument("--wandb", action="store_true", help="log tables and plots to W&B")
     ap.add_argument("--wandb_project", default="ae-midl-eval")
