@@ -3,7 +3,7 @@
 #SBATCH --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=15G
-#SBATCH --time=0-15:00
+#SBATCH --time=0-10:00
 #SBATCH --account=def-bedelb
 #SBATCH --output=logs/ae_masivar_%j.out
 #SBATCH --error=logs/ae_masivar_%j.err
