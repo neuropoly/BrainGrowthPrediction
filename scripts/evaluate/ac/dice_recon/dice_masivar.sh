@@ -48,7 +48,7 @@ STAGE=all              # all | seg | dice
 
 module load StdEnv/2023
 module load python/3.11.5
-source /home/andim/venvs/bgp/bin/activate
+source /home/andim/venvs/siam/bin/activate
 mkdir -p "$DICE_DIR" logs
 
 MANIFEST=$OUT/recon_manifest.csv
