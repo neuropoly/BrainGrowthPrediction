@@ -21,7 +21,14 @@ Adversary (v2):
               'linear' = exactly a linear probe; 'conv' = the old head.
   * age       the head also sees age (--site_age_input, on by default): sites differ in age range,
               so the adversary only removes scanner information beyond what age explains.
-  * lambda    GRL strength ramps 0 -> --grl_lambda over --grl_warmup_epochs (DANN-style).
+  * objective --adv_mode confusion (default): the head learns the scanner from a DETACHED z_mu; the
+              encoder is trained to make the (frozen) head's prediction uniform over scanners
+              (cross-entropy to uniform, Tzeng et al. 2015). Bounded below -> stable. 'grl' = gradient
+              reversal; its objective (maximise CE) is unbounded and blew z_mu up to NaN in v2 runs.
+  * head input is standardised with running per-feature mean/var (like the eval's StandardScaler) and
+              clamped, so the encoder cannot fool the head by rescaling z_mu; the head runs in fp32.
+  * lambda    adversarial strength ramps 0 -> --grl_lambda over --grl_warmup_epochs.
+  * safety    aborts after --nan_patience consecutive non-finite losses; never saves non-finite weights.
   * weights   class-weighted CE (--site_class_weights sqrt|balanced|none).
   * the label/age columns are added for EVERY arm, so all arms keep sharing the MONAI cache.
 """
@@ -145,6 +152,31 @@ class _GradReverse(torch.autograd.Function):
         return -ctx.lam * grad, None
 
 
+class RunningStandardize(nn.Module):
+    """Per-feature standardisation with running statistics (no gradient through the statistics), clamped.
+    The encoder cannot win against the head by rescaling z: the statistics follow the scale."""
+    def __init__(self, shape, momentum=0.01, clamp=10.0, eps=1e-5):
+        super().__init__()
+        self.momentum, self.clamp, self.eps = momentum, clamp, eps
+        self.register_buffer("mean", torch.zeros(shape))
+        self.register_buffer("var", torch.ones(shape))
+        self.register_buffer("initialised", torch.zeros((), dtype=torch.bool))
+
+    def forward(self, z, update=True):
+        if self.training and update:
+            with torch.no_grad():
+                zd = z.detach().float()
+                m, v = zd.mean(0), zd.var(0, unbiased=False) if zd.shape[0] > 1 else zd.new_zeros(zd.shape[1:])
+                if not bool(self.initialised):
+                    self.mean.copy_(m); self.var.copy_(v.clamp(min=1e-2) if zd.shape[0] > 1 else self.var)
+                    self.initialised.fill_(True)
+                else:
+                    self.mean.lerp_(m, self.momentum)
+                    if zd.shape[0] > 1:
+                        self.var.lerp_(v, self.momentum)
+        return ((z - self.mean) / torch.sqrt(self.var + self.eps)).clamp(-self.clamp, self.clamp)
+
+
 class SiteHead(nn.Module):
     """Predicts the scanner from z_mu (+ age); the reversed gradient pushes the encoder to remove it.
 
@@ -152,9 +184,11 @@ class SiteHead(nn.Module):
     kind='linear': flatten(z) [+age] -> classes            (exactly a linear probe)
     kind='conv'  : the v1 head (conv + global average pool); age is added before the last layer
     """
-    def __init__(self, z_shape, n_classes, lam=1.0, kind="mlp", hidden=256, use_age=True, dropout=0.2):
+    def __init__(self, z_shape, n_classes, lam=1.0, kind="mlp", hidden=256, use_age=True, dropout=0.2,
+                 standardize=True):
         super().__init__()
         self.lam, self.kind, self.use_age = lam, kind, use_age
+        self.norm = RunningStandardize(tuple(z_shape)) if standardize else None
         a = 1 if use_age else 0
         flat = int(math.prod(z_shape))
         if kind == "mlp":
@@ -173,8 +207,11 @@ class SiteHead(nn.Module):
         else:
             raise ValueError(kind)
 
-    def forward(self, z, age=None, reverse=True):
-        h = self.body(_GradReverse.apply(z, self.lam) if reverse else z)
+    def forward(self, z, age=None, reverse=True, update_stats=True):
+        z = _GradReverse.apply(z, self.lam) if reverse else z
+        if self.norm is not None:
+            z = self.norm(z, update=update_stats)
+        h = self.body(z)
         if self.use_age:
             h = torch.cat([h, ((age.float() - 48.0) / 24.0)[:, None].to(h.dtype)], dim=1)   # same scaling as eval
         return self.out(h)
@@ -303,7 +340,8 @@ def run_validation(autoencoder, discriminator, val_loader, args,
                 val_ssim = batch_ssim_scalar(reconstruction.float(), images.float(), data_range=1.0)
 
             if site_head is not None:     # how much scanner info the (adversarial) head can still read
-                logits = site_head(z_mu.float(), batch["age_in"].to(DEVICE), reverse=False)
+                with autocast(enabled=False):
+                    logits = site_head(z_mu.float(), batch["age_in"].to(DEVICE), reverse=False, update_stats=False)
                 site_pred.append(logits.argmax(1).cpu())
                 site_true.append(batch["site"].cpu())
 
@@ -362,6 +400,13 @@ if __name__ == '__main__':
                         help="label classes with fewer training scans are merged per dataset+manufacturer, "
                              "then ignored if still too small")
     parser.add_argument('--site_head',         default='mlp', choices=['mlp', 'linear', 'conv'])
+    parser.add_argument('--adv_mode',          default='confusion', choices=['confusion', 'grl'],
+                        help="confusion: head learns on detached z, encoder makes the head's output uniform "
+                             "(bounded, stable); grl: gradient reversal (unbounded, can diverge)")
+    parser.add_argument('--no_site_head_norm', action='store_true',
+                        help="do NOT standardise the head input with running statistics")
+    parser.add_argument('--nan_patience',      default=200, type=int,
+                        help="abort after this many consecutive non-finite generator losses (0 = never)")
     parser.add_argument('--site_hidden',       default=256, type=int)
     parser.add_argument('--site_class_weights', default='sqrt', choices=['sqrt', 'balanced', 'none'],
                         help="inverse-frequency CE weights (sqrt = softened)")
@@ -393,6 +438,10 @@ if __name__ == '__main__':
     if args.resume and os.path.exists(done_path):
         print(f"[resume] {done_path} exists: this run early-stopped. Delete it to train further.")
         raise SystemExit(0)
+    if args.resume and os.path.exists(os.path.join(args.output_dir, "DIVERGED")):
+        print(f"[resume] {args.output_dir}/DIVERGED exists: this run diverged. Use a new --output_dir "
+              f"(or delete the folder) to train again.")
+        raise SystemExit(1)
     resuming = args.resume and os.path.exists(state_path)
     if args.resume and not resuming:
         print(f"[resume] no {state_path} found -> starting a fresh run")
@@ -465,10 +514,12 @@ if __name__ == '__main__':
         with torch.no_grad():
             _, z_probe, _ = autoencoder(torch.zeros(1, 1, *const.INPUT_SHAPE_AE, device=DEVICE))
         site_head = SiteHead(tuple(z_probe.shape[1:]), n_site_classes, lam=0.0, kind=args.site_head,
-                             hidden=args.site_hidden, use_age=not args.no_site_age_input).to(DEVICE)
+                             hidden=args.site_hidden, use_age=not args.no_site_age_input,
+                             standardize=not args.no_site_head_norm).to(DEVICE)
         cw = class_weights(ae_train_df["site"], n_site_classes, args.site_class_weights)
         site_ce = nn.CrossEntropyLoss(weight=cw.to(DEVICE) if cw is not None else None, ignore_index=-100)
-        print(f"[adversary] head={args.site_head} z={tuple(z_probe.shape[1:])} age_input={not args.no_site_age_input} "
+        print(f"[adversary] mode={args.adv_mode} head={args.site_head} norm={not args.no_site_head_norm} "
+              f"z={tuple(z_probe.shape[1:])} age_input={not args.no_site_age_input} "
               f"params={sum(p.numel() for p in site_head.parameters()):,} | weight={args.site_weight} "
               f"lambda 0->{args.grl_lambda} over {args.grl_warmup_epochs} ep | class weights="
               f"{None if cw is None else [round(x, 2) for x in cw.tolist()]}")
@@ -529,7 +580,7 @@ if __name__ == '__main__':
         st = torch.load(state_path, map_location="cpu")
         if st["args"]["arm"] != args.arm:
             raise ValueError(f"state was saved for arm={st['args']['arm']}, not {args.arm}")
-        for k in ("site_label", "site_head", "site_min_count"):
+        for k in ("site_label", "site_head", "site_min_count", "adv_mode"):
             if use_adv and st["args"].get(k) != getattr(args, k):
                 raise ValueError(f"state was saved with {k}={st['args'].get(k)}, not {getattr(args, k)}: "
                                  f"use a new --output_dir for a different adversary")
@@ -557,6 +608,11 @@ if __name__ == '__main__':
         if start_epoch >= args.n_epochs:
             print("[resume] n_epochs already reached; nothing to do")
 
+    def all_finite(*mods):
+        return all(torch.isfinite(p).all() for m in mods if m is not None for p in m.state_dict().values()
+                   if torch.is_tensor(p) and p.is_floating_point())
+
+    nonfinite = 0
     for epoch in range(start_epoch, args.n_epochs):
         autoencoder.train()
         if site_head is not None:
@@ -582,16 +638,48 @@ if __name__ == '__main__':
                 loss_g = rec_loss + kld_loss + per_loss + gen_loss
 
                 if site_head is not None:
-                    site_head.lam = grl_lambda_at(epoch, it, loader_len, args)
+                    lam = grl_lambda_at(epoch, it, loader_len, args)
                     site_y = batch["site"].to(DEVICE)
-                    site_logits = site_head(z_mu.float(), batch["age_in"].to(DEVICE), reverse=True)
-                    if (site_y >= 0).any():
-                        site_loss = site_ce(site_logits.float(), site_y)
-                    else:                           # whole micro-batch from ignored scanners
-                        site_loss = site_logits.sum() * 0.0
-                    loss_g = loss_g + args.site_weight * site_loss
+                    age_in = batch["age_in"].to(DEVICE)
+                    with autocast(enabled=False):          # head in fp32: no fp16 overflow
+                        zf = z_mu.float()
+                        has_lab = bool((site_y >= 0).any())
+                        if args.adv_mode == "grl":
+                            site_head.lam = lam
+                            site_logits = site_head(zf, age_in, reverse=True)
+                            site_loss = site_ce(site_logits, site_y) if has_lab else site_logits.sum() * 0.0
+                            conf_loss = torch.zeros((), device=DEVICE)
+                            adv_term = args.site_weight * site_loss
+                        else:
+                            # (1) head learns the scanner from a detached latent (no gradient to the encoder)
+                            site_head.lam = 0.0
+                            site_logits = site_head(zf.detach(), age_in, reverse=False)
+                            site_loss = site_ce(site_logits, site_y) if has_lab else site_logits.sum() * 0.0
+                            # (2) encoder makes the FROZEN head's prediction uniform (0 at uniform, bounded)
+                            frozen = {k: v.detach() for k, v in site_head.named_parameters()}
+                            frozen.update(dict(site_head.named_buffers()))
+                            logits_enc = torch.func.functional_call(site_head, frozen, (zf, age_in),
+                                                                    {"reverse": False, "update_stats": False})
+                            conf_loss = (-F.log_softmax(logits_enc, dim=1).mean(1)).mean() - math.log(n_site_classes)
+                            adv_term = site_loss + args.site_weight * lam * conf_loss
+                    loss_g = loss_g + adv_term
 
-            gradacc_g.step(loss_g, it)
+            gradacc_g.step(loss_g, it)       # GradScaler skips the update if gradients are non-finite
+            if torch.isfinite(loss_g):
+                nonfinite = 0
+            else:
+                nonfinite += 1
+                if nonfinite in (1, 10, 50):
+                    print(f"[warn] non-finite generator loss at epoch {epoch} it {it} ({nonfinite} in a row)", flush=True)
+                if args.nan_patience and nonfinite >= args.nan_patience:
+                    msg = (f"aborted: {nonfinite} consecutive non-finite losses at epoch {epoch}; "
+                           f"checkpoints from before the divergence are kept")
+                    print("[abort] " + msg, flush=True)
+                    with open(os.path.join(args.output_dir, "DIVERGED"), "w") as f:
+                        f.write(msg + "\n")
+                    wandb.run.summary["diverged_epoch"] = epoch
+                    wandb.finish(exit_code=1)
+                    raise SystemExit(1)
 
             with autocast(enabled=True):
                 logits_fake = discriminator(reconstruction.contiguous().detach())[-1]
@@ -613,7 +701,9 @@ if __name__ == '__main__':
                 if ok.any():
                     avgloss.put('Train/Site/acc',
                                 (site_logits.argmax(1).cpu()[ok] == batch["site"][ok]).float().mean().item())
-                avgloss.put('Train/Site/grl_lambda', site_head.lam)
+                avgloss.put('Train/Site/grl_lambda', lam)
+                avgloss.put('Train/Site/conf_loss', float(conf_loss.item()))
+                avgloss.put('Train/Site/z_absmean', float(z_mu.detach().float().abs().mean().item()))
 
             if total_counter % args.log_scalars_every == 0:
                 avgloss.to_wandb(wandb, step=total_counter)
@@ -652,6 +742,12 @@ if __name__ == '__main__':
               f"ssim: ep={best_ssim['epoch']} ssim={best_ssim['ssim']:.6g}")
 
         # last checkpoint (overwritten) + sparse periodic ones instead of 600 files
+        if not all_finite(autoencoder, discriminator, site_head):
+            print(f"[abort] non-finite weights after epoch {epoch}: last/state checkpoints NOT overwritten", flush=True)
+            with open(os.path.join(args.output_dir, "DIVERGED"), "w") as f:
+                f.write(f"non-finite weights after epoch {epoch}\n")
+            wandb.finish(exit_code=1)
+            raise SystemExit(1)
         save("last")
         save_state(epoch)
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
