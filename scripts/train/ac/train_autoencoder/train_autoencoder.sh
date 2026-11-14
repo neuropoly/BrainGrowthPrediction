@@ -57,6 +57,6 @@ python /home/andim/BrainGrowthPrediction/scripts/train/train_autoencoder.py \
 #   python make_splits.py ${DATA}/datasets_all.csv --out-dir ${DATA}/splits
 #
 # If a job hits the time limit, resubmit only that index; it continues from state-last.pt
-# in the same W&B run:   sbatch --array=2 run_ae_arms.sh
+# in the same W&B run:   sbatch --array=2 train_autoencoder.sh
 # A run that early-stopped writes OUT_DIR/DONE and exits immediately if resubmitted.
 # ---------------------------------------------------------------------------

@@ -3,12 +3,29 @@ Autoencoder training for the MIDL experiments (single fixed split, 4 arms).
 
     --arm baseline : no augmentation, no site adversary
     --arm aug      : scanner/site augmentations on the INPUT, clean image as TARGET
-    --arm adv      : gradient-reversal site classifier on z_mu
+    --arm adv      : gradient-reversal SCANNER classifier on z_mu
     --arm aug_adv  : both
 
-Expects the CSV written by make_splits.py (columns: role, dataset, weight_scan_sqrt, ...).
-Trains on role == 'train', validates on role == 'val'. Test / external_tbi / excluded_ndd are never loaded.
+Expects the CSV written by make_splits.py (columns: role, dataset, scanner_key, age_bef_norm,
+weight_scan_sqrt, ...). Trains on role == 'train', validates on role == 'val'.
+Test / external_* / excluded_ndd are never loaded.
+
+Adversary (v2):
+  * label     --site_label scanner_key (default): manufacturer|model|site|scanner id. Varies inside
+              datasets (BCP 2 sites, PING 7, Pixar 2 scanners), so the adversary targets acquisition
+              rather than cohort. Scanners with < --site_min_count training scans are merged per
+              dataset+manufacturer ("<dataset>|<manufacturer>|other"); if still too small they are
+              ignored by the loss (label -100).
+  * head      --site_head mlp (default): flatten(z_mu) [+ age] -> 256 -> classes, i.e. at least as strong
+              as the linear probe used in evaluation (the old head average-pooled z to 32 numbers).
+              'linear' = exactly a linear probe; 'conv' = the old head.
+  * age       the head also sees age (--site_age_input, on by default): sites differ in age range,
+              so the adversary only removes scanner information beyond what age explains.
+  * lambda    GRL strength ramps 0 -> --grl_lambda over --grl_warmup_epochs (DANN-style).
+  * weights   class-weighted CE (--site_class_weights sqrt|balanced|none).
+  * the label/age columns are added for EVERY arm, so all arms keep sharing the MONAI cache.
 """
+import json
 import os
 import argparse
 import warnings
@@ -44,6 +61,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # PersistentDataset cache files (they contain MetaTensor objects). The cache files are
 # written by this script itself, so loading them with weights_only=False is safe.
 import functools
+import math
 import time
 import uuid
 torch.load = functools.partial(torch.load, weights_only=False)
@@ -128,18 +146,90 @@ class _GradReverse(torch.autograd.Function):
 
 
 class SiteHead(nn.Module):
-    """Predicts the site from z_mu; the reversed gradient pushes the encoder to remove site info."""
-    def __init__(self, in_ch, n_sites, lam=1.0):
-        super().__init__()
-        self.lam = lam
-        self.net = nn.Sequential(
-            nn.Conv3d(in_ch, 32, 3, padding=1), nn.LeakyReLU(0.2),
-            nn.Conv3d(32, 32, 3, padding=1, stride=2), nn.LeakyReLU(0.2),
-            nn.AdaptiveAvgPool3d(1), nn.Flatten(), nn.Linear(32, n_sites),
-        )
+    """Predicts the scanner from z_mu (+ age); the reversed gradient pushes the encoder to remove it.
 
-    def forward(self, z, reverse=True):
-        return self.net(_GradReverse.apply(z, self.lam) if reverse else z)
+    kind='mlp'   : flatten(z) [+age] -> hidden -> classes  (default; >= linear probe capacity)
+    kind='linear': flatten(z) [+age] -> classes            (exactly a linear probe)
+    kind='conv'  : the v1 head (conv + global average pool); age is added before the last layer
+    """
+    def __init__(self, z_shape, n_classes, lam=1.0, kind="mlp", hidden=256, use_age=True, dropout=0.2):
+        super().__init__()
+        self.lam, self.kind, self.use_age = lam, kind, use_age
+        a = 1 if use_age else 0
+        flat = int(math.prod(z_shape))
+        if kind == "mlp":
+            self.body = nn.Flatten()
+            self.out = nn.Sequential(nn.Dropout(dropout), nn.Linear(flat + a, hidden), nn.LeakyReLU(0.2),
+                                     nn.Dropout(dropout), nn.Linear(hidden, n_classes))
+        elif kind == "linear":
+            self.body = nn.Flatten()
+            self.out = nn.Linear(flat + a, n_classes)
+        elif kind == "conv":
+            c = z_shape[0]
+            self.body = nn.Sequential(nn.Conv3d(c, 32, 3, padding=1), nn.LeakyReLU(0.2),
+                                      nn.Conv3d(32, 32, 3, padding=1, stride=2), nn.LeakyReLU(0.2),
+                                      nn.AdaptiveAvgPool3d(1), nn.Flatten())
+            self.out = nn.Linear(32 + a, n_classes)
+        else:
+            raise ValueError(kind)
+
+    def forward(self, z, age=None, reverse=True):
+        h = self.body(_GradReverse.apply(z, self.lam) if reverse else z)
+        if self.use_age:
+            h = torch.cat([h, ((age.float() - 48.0) / 24.0)[:, None].to(h.dtype)], dim=1)   # same scaling as eval
+        return self.out(h)
+
+
+def grl_lambda_at(epoch, it, n_iter, args):
+    """Linear ramp 0 -> grl_lambda over grl_warmup_epochs (by fractional epoch)."""
+    if args.grl_warmup_epochs <= 0:
+        return args.grl_lambda
+    p = (epoch + it / max(n_iter, 1)) / args.grl_warmup_epochs
+    return args.grl_lambda * min(1.0, p)
+
+
+def build_site_labels(train_df, val_df, col, min_count):
+    """Map the adversary label to ints. Rare classes -> '<dataset>|<manufacturer>|other', still rare -> -100."""
+    raw_tr = train_df[col].astype(str)
+    counts = raw_tr.value_counts()
+    rare = set(counts[counts < min_count].index)
+
+    def merged(df):
+        raw = df[col].astype(str)
+        if not rare:
+            return raw
+        manu = df["manufacturer"].astype(str) if "manufacturer" in df else "NA"
+        return raw.where(~raw.isin(rare), df["dataset"].astype(str) + "|" + manu + "|other")
+
+    m_tr = merged(train_df)
+    m_counts = m_tr.value_counts()
+    keep = sorted(m_counts[m_counts >= min_count].index)
+    to_idx = {k: i for i, k in enumerate(keep)}
+    lab_tr = m_tr.map(to_idx).fillna(-100).astype(int)
+    lab_va = merged(val_df).map(to_idx).fillna(-100).astype(int)     # val scanners unseen in train -> ignored
+    info = {"column": col, "min_count": min_count, "classes": to_idx,
+            "train_counts": {k: int(m_counts[k]) for k in keep},
+            "merged_rare": sorted(rare), "ignored_train_scans": int((lab_tr < 0).sum()),
+            "ignored_val_scans": int((lab_va < 0).sum())}
+    return lab_tr, lab_va, info
+
+
+def class_weights(labels, n_classes, mode):
+    if mode == "none":
+        return None
+    cnt = torch.bincount(torch.as_tensor(labels[labels >= 0].to_numpy().copy()), minlength=n_classes).double().clamp(min=1)
+    w = (cnt.sum() / (n_classes * cnt))
+    if mode == "sqrt":
+        w = w.sqrt()
+    return (w / w.mean()).float()     # mean 1: keeps the loss scale comparable across modes
+
+
+def balanced_acc(pred, y):
+    ok = y >= 0
+    pred, y = pred[ok], y[ok]
+    if len(y) == 0:
+        return float("nan")
+    return float(torch.stack([(pred[y == c] == c).float().mean() for c in y.unique()]).mean())
 
 
 # ---------------------------------------------------------------------------
@@ -181,10 +271,13 @@ def no_aug():
 # Validation (always clean input -> clean target)
 # ---------------------------------------------------------------------------
 def run_validation(autoencoder, discriminator, val_loader, args,
-                   l1_loss_fn, kl_loss_fn, perc_loss_fn, adv_loss_fn, max_batches=0):
+                   l1_loss_fn, kl_loss_fn, perc_loss_fn, adv_loss_fn, max_batches=0, site_head=None):
     autoencoder.eval()
     discriminator.eval()
+    if site_head is not None:
+        site_head.eval()
     sums, n = defaultdict(float), 0
+    site_pred, site_true = [], []
     with torch.no_grad():
         for b_idx, batch in enumerate(val_loader):
             if max_batches and b_idx >= max_batches:
@@ -209,6 +302,11 @@ def run_validation(autoencoder, discriminator, val_loader, args,
 
                 val_ssim = batch_ssim_scalar(reconstruction.float(), images.float(), data_range=1.0)
 
+            if site_head is not None:     # how much scanner info the (adversarial) head can still read
+                logits = site_head(z_mu.float(), batch["age_in"].to(DEVICE), reverse=False)
+                site_pred.append(logits.argmax(1).cpu())
+                site_true.append(batch["site"].cpu())
+
             bs = images.shape[0]
             n += bs
             sums["Val/Generator/reconstruction_loss"] += rec_loss.item() * bs
@@ -221,7 +319,12 @@ def run_validation(autoencoder, discriminator, val_loader, args,
             sums["Val/SSIM"] += float(val_ssim.item()) * bs
     autoencoder.train()
     discriminator.train()
-    return {k: v / max(n, 1) for k, v in sums.items()}
+    out = {k: v / max(n, 1) for k, v in sums.items()}
+    if site_head is not None:
+        site_head.train()
+        if site_pred:
+            out["Val/Site/bacc"] = balanced_acc(torch.cat(site_pred), torch.cat(site_true))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +350,23 @@ if __name__ == '__main__':
     parser.add_argument('--min_kl_raw',        default=3000, type=float)
     # new
     parser.add_argument('--aug_p',             default=0.3, type=float, help="probability of EACH augmentation")
-    parser.add_argument('--site_weight',       default=0.01, type=float)
-    parser.add_argument('--grl_lambda',        default=1.0, type=float)
+    parser.add_argument('--site_weight',       default=0.1, type=float,
+                        help="weight of the adversarial CE in the generator loss (v1 used 0.01)")
+    parser.add_argument('--grl_lambda',        default=1.0, type=float, help="final GRL strength")
+    parser.add_argument('--grl_warmup_epochs', default=50, type=int,
+                        help="ramp the GRL strength linearly from 0 over this many epochs (0 = constant)")
+    parser.add_argument('--site_label',        default='scanner_key',
+                        choices=['scanner_key', 'scanner', 'site', 'manufacturer', 'dataset'],
+                        help="adversary target column")
+    parser.add_argument('--site_min_count',    default=8, type=int,
+                        help="label classes with fewer training scans are merged per dataset+manufacturer, "
+                             "then ignored if still too small")
+    parser.add_argument('--site_head',         default='mlp', choices=['mlp', 'linear', 'conv'])
+    parser.add_argument('--site_hidden',       default=256, type=int)
+    parser.add_argument('--site_class_weights', default='sqrt', choices=['sqrt', 'balanced', 'none'],
+                        help="inverse-frequency CE weights (sqrt = softened)")
+    parser.add_argument('--no_site_age_input', action='store_true',
+                        help="do NOT give age to the adversary (default: age is an extra input)")
     parser.add_argument('--sample_weight',     default='weight_scan_sqrt',
                         choices=['none', 'weight_scan', 'weight_scan_sqrt'])
     parser.add_argument('--patience',          default=100, type=int,
@@ -297,12 +415,23 @@ if __name__ == '__main__':
     ae_train_df = df[df.role == "train"].reset_index(drop=True)
     ae_val_df = df[df.role == "val"].reset_index(drop=True)
 
-    sites = sorted(ae_train_df.dataset.unique())
-    site_to_idx = {s: i for i, s in enumerate(sites)}
-    ae_train_df["site"] = ae_train_df.dataset.map(site_to_idx)
-    ae_val_df["site"] = ae_val_df.dataset.map(site_to_idx)
-    print(f"\n=== arm={args.arm} seed={args.seed} | train scans={len(ae_train_df)} "
-          f"val scans={len(ae_val_df)} | sites={site_to_idx} ===")
+    # adversary label + age, added for EVERY arm (identical items -> all arms share the MONAI cache)
+    if args.site_label not in ae_train_df.columns:
+        raise KeyError(f"--site_label {args.site_label} is not a column of {args.dataset_csv}")
+    lab_tr, lab_va, site_info = build_site_labels(ae_train_df, ae_val_df, args.site_label, args.site_min_count)
+    ae_train_df["site"], ae_val_df["site"] = lab_tr.values, lab_va.values
+    ae_train_df["age_in"] = ae_train_df["age_bef_norm"].astype(float)
+    ae_val_df["age_in"] = ae_val_df["age_bef_norm"].astype(float)
+    n_site_classes = len(site_info["classes"])
+    with open(os.path.join(args.output_dir, "site_labels.json"), "w") as f:
+        json.dump(site_info, f, indent=1)
+    print(f"\n=== arm={args.arm} seed={args.seed} | train scans={len(ae_train_df)} val scans={len(ae_val_df)} ===")
+    print(f"[adversary label] {args.site_label}: {n_site_classes} classes")
+    for k, v in site_info["train_counts"].items():
+        print(f"    {site_info['classes'][k]:2d}  {k:45s} {v} train scans")
+    if site_info["merged_rare"]:
+        print(f"    merged (< {args.site_min_count} scans): {site_info['merged_rare']}")
+    print(f"    ignored by the loss: {site_info['ignored_train_scans']} train, {site_info['ignored_val_scans']} val scans")
 
     train_tf = transforms.Compose(base_transforms() + (site_augmentations(args.aug_p) if use_aug else no_aug()))
     val_tf = transforms.Compose(base_transforms())
@@ -326,11 +455,18 @@ if __name__ == '__main__':
     autoencoder = init_autoencoder(args.aekl_ckpt).to(DEVICE)
     discriminator = init_patch_discriminator(args.disc_ckpt).to(DEVICE)
 
-    site_head = None
+    site_head, site_ce = None, None
     if use_adv:
         with torch.no_grad():
             _, z_probe, _ = autoencoder(torch.zeros(1, 1, *const.INPUT_SHAPE_AE, device=DEVICE))
-        site_head = SiteHead(z_probe.shape[1], len(sites), lam=args.grl_lambda).to(DEVICE)
+        site_head = SiteHead(tuple(z_probe.shape[1:]), n_site_classes, lam=0.0, kind=args.site_head,
+                             hidden=args.site_hidden, use_age=not args.no_site_age_input).to(DEVICE)
+        cw = class_weights(ae_train_df["site"], n_site_classes, args.site_class_weights)
+        site_ce = nn.CrossEntropyLoss(weight=cw.to(DEVICE) if cw is not None else None, ignore_index=-100)
+        print(f"[adversary] head={args.site_head} z={tuple(z_probe.shape[1:])} age_input={not args.no_site_age_input} "
+              f"params={sum(p.numel() for p in site_head.parameters()):,} | weight={args.site_weight} "
+              f"lambda 0->{args.grl_lambda} over {args.grl_warmup_epochs} ep | class weights="
+              f"{None if cw is None else [round(x, 2) for x in cw.tolist()]}")
 
     l1_loss_fn = L1Loss()
     kl_loss_fn = KLDivergenceLoss()
@@ -388,6 +524,10 @@ if __name__ == '__main__':
         st = torch.load(state_path, map_location="cpu")
         if st["args"]["arm"] != args.arm:
             raise ValueError(f"state was saved for arm={st['args']['arm']}, not {args.arm}")
+        for k in ("site_label", "site_head", "site_min_count"):
+            if use_adv and st["args"].get(k) != getattr(args, k):
+                raise ValueError(f"state was saved with {k}={st['args'].get(k)}, not {getattr(args, k)}: "
+                                 f"use a new --output_dir for a different adversary")
         autoencoder.load_state_dict(st["autoencoder"])
         discriminator.load_state_dict(st["discriminator"])
         if site_head is not None:
@@ -437,8 +577,13 @@ if __name__ == '__main__':
                 loss_g = rec_loss + kld_loss + per_loss + gen_loss
 
                 if site_head is not None:
-                    site_logits = site_head(z_mu.float(), reverse=True)
-                    site_loss = F.cross_entropy(site_logits, batch["site"].to(DEVICE))
+                    site_head.lam = grl_lambda_at(epoch, it, loader_len, args)
+                    site_y = batch["site"].to(DEVICE)
+                    site_logits = site_head(z_mu.float(), batch["age_in"].to(DEVICE), reverse=True)
+                    if (site_y >= 0).any():
+                        site_loss = site_ce(site_logits.float(), site_y)
+                    else:                           # whole micro-batch from ignored scanners
+                        site_loss = site_logits.sum() * 0.0
                     loss_g = loss_g + args.site_weight * site_loss
 
             gradacc_g.step(loss_g, it)
@@ -459,7 +604,11 @@ if __name__ == '__main__':
             avgloss.put('Train/Discriminator/adverarial_loss', loss_d.item())
             if site_head is not None:
                 avgloss.put('Train/Site/ce_loss', site_loss.item())
-                avgloss.put('Train/Site/acc', (site_logits.argmax(1).cpu() == batch["site"]).float().mean().item())
+                ok = batch["site"] >= 0
+                if ok.any():
+                    avgloss.put('Train/Site/acc',
+                                (site_logits.argmax(1).cpu()[ok] == batch["site"][ok]).float().mean().item())
+                avgloss.put('Train/Site/grl_lambda', site_head.lam)
 
             if total_counter % args.log_scalars_every == 0:
                 avgloss.to_wandb(wandb, step=total_counter)
@@ -471,7 +620,7 @@ if __name__ == '__main__':
         # ---------------- validation / checkpoints ----------------
         val_metrics = run_validation(autoencoder, discriminator, val_loader, args,
                                      l1_loss_fn, kl_loss_fn, perc_loss_fn, adv_loss_fn,
-                                     max_batches=args.debug_steps)
+                                     max_batches=args.debug_steps, site_head=site_head)
         score, ssim, klraw = (val_metrics["Val/Generator/total_loss"], val_metrics["Val/SSIM"],
                               val_metrics["Val/Generator/kl_raw"])
         eligible = klraw >= args.min_kl_raw
