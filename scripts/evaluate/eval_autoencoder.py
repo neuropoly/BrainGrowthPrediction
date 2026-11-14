@@ -8,15 +8,23 @@ Step 1 (GPU, --stage encode): every scan is loaded ONCE and passed through every
       so SiamSeg can segment both and dice_recon.py can compare them
 Step 2 (CPU, --stage analyze): fresh probes on the frozen latents
     - site probe   (internal sites; lower = more site-invariant), raw and age-residualised,
-                    with an "age only" reference because sites differ in age range
+                    with an "age only" reference because sites differ in age range;
+                    done for every --probe_labels column (dataset -> site_*, scanner_key -> scanner_*)
     - age probe    (developmental content; MAE in months)
     - reconstruction quality per site, internal test vs unseen external sites
     - 95% CIs by bootstrapping SUBJECTS; paired Wilcoxon of each run vs --reference
-    - latent_plots.png: PCA and t-SNE of the latents coloured by site and by age
+    - latent_plots.png (by dataset), latent_plots_manufacturer.png, latent_plots_scanner_key.png:
+      PCA and t-SNE of the latents coloured by that column and by age (--plot_color_by)
     - optional W&B logging of tables and plots (--wandb)
 
 Checkpoint selection is fixed in advance (validation only): autoencoder-best-loss.pth.
 The test set and the external sites are never used to choose anything.
+
+External groups: every role in EXTERNAL_ROLES present in the CSV (external_tbi = TBI cohorts,
+external_hc = unseen healthy controls, e.g. MASiVar) is evaluated as its own split:
+metrics are named <metric>_<role> (ssim_external_hc, age_mae_external_hc, ...).
+Files and pairing use scan_id = image_uid, or <dataset>__<image_uid> where an image_uid occurs
+in more than one dataset (Koala and Kaouenn share a few).
 
 Usage:
   python eval_autoencoder.py --dataset_csv splits/datasets_splits.csv --out_dir eval/ \
@@ -36,9 +44,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROLES = ["train", "val", "test", "external_tbi"]
+EXTERNAL_ROLES = ["external_tbi", "external_hc"]
+ROLES = ["train", "val", "test"] + EXTERNAL_ROLES
 # validated categorical order (light surface); identity is also given by legend + marker shape
-SITE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+SITE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948",
+               "#0aa3b5", "#8a5a2b"]     # 5 internal + 4 external sites need 9 colours
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +76,7 @@ def encode_all(args, df):
     ])
     out = Path(args.out_dir)
     progress_path = out / "encode_progress.pkl"
-    uids = df["image_uid"].tolist()
+    uids = df["scan_id"].tolist()
 
     # ---- resume: continue after the last saved scan of an interrupted run ----
     latents, metrics, manifest, start = {n: [] for n in args.runs}, [], [], 0
@@ -143,7 +153,7 @@ def encode_all(args, df):
                 affine = (aff[0] if aff is not None and aff.ndim == 3 else aff)
                 affine = np.asarray(affine.cpu() if hasattr(affine, "cpu") else np.diag([*const.RESOLUTION, 1.0]),
                                     dtype=np.float64)
-                in_path = recon_dir / "input" / f"{row['image_uid']}.nii.gz"
+                in_path = recon_dir / "input" / f"{row['scan_id']}.nii.gz"
                 write_nifti(x, affine, in_path)
 
             for name, m in models.items():
@@ -166,9 +176,10 @@ def encode_all(args, df):
                                     "ssim": ssim3d(rec, x)})
 
                 if save_this and name in save_runs:
-                    rec_path = recon_dir / name / f"{row['image_uid']}.nii.gz"
+                    rec_path = recon_dir / name / f"{row['scan_id']}.nii.gz"
                     write_nifti(rec, affine, rec_path)
-                    manifest.append({"image_uid": row["image_uid"], "dataset": row["dataset"],
+                    manifest.append({"image_uid": row["scan_id"], "orig_image_uid": row["image_uid"],
+                                     "dataset": row["dataset"],
                                      "subject_id": row["subject_id"], "role": row["role"], "arm": name,
                                      "input_path": str(in_path), "recon_path": str(rec_path)})
 
@@ -228,9 +239,156 @@ def latent_features(Z, tr, age, n_pcs):
     return P, P - reg.predict(age_basis(age)), pca.explained_variance_ratio_
 
 
-def plot_latents(args, idx, feats, path):
-    """Rows = runs. Columns: PCA by site | t-SNE by site | t-SNE by age | t-SNE (age removed) by site.
-    Points = held-out scans (val, test, external) so the plot shows unseen data."""
+def _center_by(F, groups, fit_mask):
+    """Subtract each group's mean, estimated on fit_mask rows (falls back to all fit rows)."""
+    out = F.copy()
+    overall = F[fit_mask].mean(0)
+    for g in np.unique(groups):
+        m = groups == g
+        ref = m & fit_mask
+        out[m] -= F[ref].mean(0) if ref.any() else overall
+    return out
+
+
+def group_probe(args, idx, feats):
+    """Can mTBI vs control-like (CC + OI + control) be read from the frozen latents of the external
+    TBI cohorts? Group is confounded with cohort (Daufin ~all controls, Kaouenn mostly patients), so:
+      pooled_latent        PCs, all external_tbi cohorts
+      pooled_latent_ctr    PCs with cohort means removed (fold-wise, from training folds only)
+      within_<cohort>      PCs, one cohort only (cohorts with >= group_min_per_class per class),
+                           scanner means removed
+      baselines            cohort+scanner one-hot only; age+sex only (pooled and per cohort)
+    Repeated stratified CV (subjects never split), balanced accuracy + ROC AUC on out-of-fold
+    predictions; p-value by permutation of labels WITHIN cohort (keeps the cohort confound in the null).
+    The PCA is the one fitted on internal TRAIN scans, so no external information shapes the features."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+    from sklearn.model_selection import StratifiedGroupKFold
+    from sklearn.preprocessing import StandardScaler
+
+    col = args.group_col
+    if col not in idx.columns:
+        print(f"[group] skip: no column {col}")
+        return None
+    lab = idx[col].astype(str)
+    y_all = np.where(lab.isin(args.group_case), 1, np.where(lab.isin(args.group_control), 0, -1))
+    base = ((idx.role == "external_tbi").values) & (y_all >= 0)
+    if base.sum() < 10:
+        print("[group] skip: fewer than 10 labelled external_tbi scans")
+        return None
+    rng0 = np.random.default_rng(0)
+    subj_all = (idx.dataset + "|" + idx.subject_id.astype(str)).values
+    cohort_all = idx.dataset.astype(str).values
+    scanner_all = idx["scanner_key"].astype(str).values if "scanner_key" in idx else cohort_all
+    sex_all = pd.to_numeric(idx.get("sex", pd.Series(np.nan, index=idx.index)), errors="coerce").fillna(0.5).values
+    age_all = idx["age_bef_norm"].values.astype(float)
+
+    def cv_scores(X, y, groups, center=None, perm_strata=None, n_rep=None, n_perm=0):
+        """Out-of-fold balanced accuracy / AUC per CV repeat (+ permutation p on repeat 0's folds)."""
+        n_rep = n_rep or args.group_repeats
+        k = int(min(args.group_folds, np.bincount(y).min()))
+        if k < 2:
+            return None
+
+        def oof(yy, seed):
+            score = np.zeros(len(yy))
+            for trn, tst in StratifiedGroupKFold(k, shuffle=True, random_state=seed).split(X, yy, groups):
+                Xtr, Xte = X[trn], X[tst]
+                if center is not None:
+                    fit = np.zeros(len(X), bool); fit[trn] = True
+                    Xc = _center_by(X, center, fit)
+                    Xtr, Xte = Xc[trn], Xc[tst]
+                sc = StandardScaler().fit(Xtr)
+                clf = LogisticRegression(C=args.group_C, class_weight="balanced", max_iter=5000)
+                clf.fit(sc.transform(Xtr), yy[trn])
+                score[tst] = clf.decision_function(sc.transform(Xte))
+            return score
+
+        bacc, auc = [], []
+        for r in range(n_rep):
+            s = oof(y, r)
+            bacc.append(balanced_accuracy_score(y, (s > 0).astype(int)))
+            auc.append(roc_auc_score(y, s))
+        p = np.nan
+        if n_perm:
+            obs = auc[0]
+            null = []
+            strata = perm_strata if perm_strata is not None else np.zeros(len(y))
+            for _ in range(n_perm):
+                yp = y.copy()
+                for g in np.unique(strata):          # shuffle labels within each cohort
+                    m = strata == g
+                    yp[m] = rng0.permutation(yp[m])
+                if np.bincount(yp, minlength=2).min() < 2:
+                    continue
+                null.append(roc_auc_score(yp, oof(yp, 0)))
+            null = np.array(null)
+            p = (1 + (null >= obs).sum()) / (1 + len(null))
+        return {"k_folds": k, "bacc": float(np.mean(bacc)), "bacc_lo": float(np.percentile(bacc, 2.5)),
+                "bacc_hi": float(np.percentile(bacc, 97.5)), "auc": float(np.mean(auc)),
+                "auc_lo": float(np.percentile(auc, 2.5)), "auc_hi": float(np.percentile(auc, 97.5)),
+                "perm_p_auc": p}
+
+    def run(tag, arm, mask, X, center=None, perm_strata="cohort"):
+        y = y_all[mask]
+        if np.bincount(y, minlength=2).min() < args.group_min_per_class:
+            return
+        strata = {"cohort": cohort_all, "scanner": scanner_all}.get(perm_strata)
+        r = cv_scores(X, y, subj_all[mask], center=None if center is None else center[mask],
+                      perm_strata=None if strata is None else strata[mask], n_perm=args.group_n_perm)
+        if r is None:
+            return
+        rows.append({"arm": arm, "analysis": tag, "n": int(mask.sum()), "n_case": int(y.sum()),
+                     "n_control": int((y == 0).sum()), **r})
+
+    rows = []
+    cohorts = [c for c in sorted(np.unique(cohort_all[base]))
+               if np.bincount(y_all[base & (cohort_all == c)], minlength=2).min() >= args.group_min_per_class]
+
+    # ---- baselines (no latents) ----
+    onehot = pd.get_dummies(pd.Series(cohort_all + "|" + scanner_all)).values.astype(float)
+    agesex = np.c_[age_all, sex_all]
+    run("baseline_cohort_scanner_only", "-", base, onehot[base])
+    run("baseline_age_sex", "-", base, agesex[base])
+    for c in cohorts:
+        m = base & (cohort_all == c)
+        run(f"baseline_age_sex_within_{c}", "-", m, agesex[m], perm_strata="scanner")
+
+    # ---- latents ----
+    n_pc = args.group_n_pcs
+    for name in args.runs:
+        P = feats[name][0][:, :n_pc]
+        run("pooled_latent", name, base, P[base])
+        run("pooled_latent_ctr", name, base, P[base], center=cohort_all)
+        for c in cohorts:
+            m = base & (cohort_all == c)
+            run(f"within_{c}", name, m, P[m], center=scanner_all, perm_strata="scanner")
+        print(f"[group] {name}")
+    return pd.DataFrame(rows)
+
+
+CAT_COLORS = SITE_COLORS + ["#5b8def", "#f29e6d", "#62c99b", "#f3c04d", "#f0a6c4", "#4fa84f", "#9686e8",
+                           "#ef8584", "#59c3cf", "#b8875a", "#3d3d3a", "#a3a29c"]     # up to 22 categories
+
+
+def _short_label(col, v):
+    v = str(v)
+    if col == "scanner_key":                 # "Siemens|Prisma|UMN|UMN" -> "Siemens Prisma UMN"
+        parts = [p for p in v.split("|") if p and p != "NA"]
+        out = []
+        for p in parts:
+            if out and (p == out[-1] or out[-1].endswith("_" + p)):   # "UMN|UMN", "ping_i|i"
+                continue
+            out.append(p)
+        v = " ".join(out)
+    return v
+
+
+def plot_latents(args, idx, feats, out_dir):
+    """One figure per --plot_color_by column (dataset -> latent_plots.png, other -> latent_plots_<col>.png).
+    Rows = runs. Columns: PCA | t-SNE | t-SNE by age | t-SNE after removing age, coloured by the column.
+    Marker: circle = internal scan, triangle = external. Points = held-out scans (val, test, external).
+    t-SNE is computed once per run and reused for every figure."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -238,65 +396,96 @@ def plot_latents(args, idx, feats, path):
     from matplotlib.lines import Line2D
     from sklearn.manifold import TSNE
 
-    show = idx.role.isin(["val", "test", "external_tbi"]).values
+    show = idx.role.isin(["val", "test"] + EXTERNAL_ROLES).values
     sub = idx[show].reset_index(drop=True)
-    internal = sorted(idx.loc[idx.role != "external_tbi", "dataset"].unique())
-    external = sorted(idx.loc[idx.role == "external_tbi", "dataset"].unique())
-    order = internal + external
-    color = {d: SITE_COLORS[i % len(SITE_COLORS)] for i, d in enumerate(order)}
-    is_ext = (sub.role == "external_tbi").values
+    is_ext = sub.role.isin(EXTERNAL_ROLES).values
     age = sub["age_bef_norm"].values.astype(float)
     age_cmap = LinearSegmentedColormap.from_list("age", ["#cde2fb", "#3987e5", "#0d366b"])   # one hue, light->dark
     perplexity = max(5, min(30, (len(sub) - 1) // 3))
-
     ink, grid = "#3d3d3a", "#e4e3dd"
     n = len(args.runs)
-    fig, axes = plt.subplots(n, 4, figsize=(16, 3.6 * n + 0.8), squeeze=False)
 
-    def scatter_sites(ax, xy):
-        for d in order:
-            m = (sub.dataset == d).values
-            if not m.any():
-                continue
-            ax.scatter(xy[m, 0], xy[m, 1], s=16 if d in internal else 30, c=color[d],
-                       marker="o" if d in internal else "^", linewidths=0.6,
-                       edgecolors="white" if d in internal else ink, alpha=0.85, zorder=3 if d in external else 2)
-
-    for r, name in enumerate(args.runs):
+    emb = {}
+    for name in args.runs:
         P, P_res = feats[name]
         P, P_res = P[show], P_res[show]
-        ts = TSNE(2, perplexity=perplexity, init="pca", random_state=0).fit_transform(P)
-        ts_res = TSNE(2, perplexity=perplexity, init="pca", random_state=0).fit_transform(P_res)
+        emb[name] = (P[:, :2],
+                     TSNE(2, perplexity=perplexity, init="pca", random_state=0).fit_transform(P),
+                     TSNE(2, perplexity=perplexity, init="pca", random_state=0).fit_transform(P_res))
 
-        scatter_sites(axes[r, 0], P[:, :2])
-        scatter_sites(axes[r, 1], ts)
-        sc = axes[r, 2].scatter(ts[:, 0], ts[:, 1], s=16, c=age, cmap=age_cmap, linewidths=0.4,
-                                edgecolors="white")
-        axes[r, 2].scatter(ts[is_ext, 0], ts[is_ext, 1], s=30, facecolors="none", edgecolors=ink,
-                           marker="^", linewidths=0.6)
-        scatter_sites(axes[r, 3], ts_res)
-        cb = fig.colorbar(sc, ax=axes[r, 2], fraction=0.046, pad=0.02)
-        cb.set_label("age (months)", color=ink, fontsize=8)
-        cb.ax.tick_params(labelsize=7, colors=ink)
+    paths = []
+    for col in args.plot_color_by:
+        if col not in sub.columns:
+            print(f"[plot] skip {col}: not a column")
+            continue
+        lab = sub[col].fillna("NA").map(lambda v: _short_label(col, v))
+        # order: categories seen in internal scans first, then external-only ones
+        internal = sorted(lab[~is_ext].unique())
+        external = sorted(set(lab[is_ext].unique()) - set(internal))
+        order = internal + external
+        if len(order) > len(CAT_COLORS):
+            print(f"[plot] {col}: {len(order)} categories > {len(CAT_COLORS)} colours; colours repeat "
+                  f"(marker shape still separates internal/external)")
+        color = {d: CAT_COLORS[i % len(CAT_COLORS)] for i, d in enumerate(order)}
+        # tag "(external only)" only for categories that never occur in internal data (train included)
+        all_int = set(idx.loc[~idx.role.isin(EXTERNAL_ROLES), col].fillna("NA").map(lambda v: _short_label(col, v)))
+        ext_only = set(external) - all_int
 
-        titles = ["PCA (PC1 vs PC2), by site", "t-SNE, by site", "t-SNE, by age", "t-SNE after removing age, by site"]
-        for c, ax in enumerate(axes[r]):
-            ax.set_xticks([]); ax.set_yticks([])
-            for s in ax.spines.values():
-                s.set_color(grid)
-            if r == 0:
-                ax.set_title(titles[c], fontsize=10, color=ink)
-        axes[r, 0].set_ylabel(name, fontsize=11, color=ink, fontweight="bold")
+        fig, axes = plt.subplots(n, 4, figsize=(16, 3.6 * n + 1.2), squeeze=False)
 
-    handles = [Line2D([], [], marker="o" if d in internal else "^", linestyle="", markersize=7,
-                      markerfacecolor=color[d], markeredgecolor="white" if d in internal else ink,
-                      label=d + ("  (external)" if d in external else "")) for d in order]
-    fig.legend(handles=handles, loc="upper center", ncol=min(len(order), 7), frameon=False, fontsize=9,
-               labelcolor=ink, bbox_to_anchor=(0.5, 1.0))
-    fig.tight_layout(rect=(0, 0, 1, 1 - 0.5 / (3.6 * n + 0.8)))
-    fig.savefig(path, dpi=150, facecolor="white")
-    plt.close(fig)
-    print(f"[plot] {path}")
+        def scatter(ax, xy):
+            for d in order:
+                for ext in (False, True):
+                    m = ((lab == d).values) & (is_ext == ext)
+                    if not m.any():
+                        continue
+                    ax.scatter(xy[m, 0], xy[m, 1], s=30 if ext else 16, c=color[d], marker="^" if ext else "o",
+                               linewidths=0.6, edgecolors=ink if ext else "white", alpha=0.85,
+                               zorder=3 if ext else 2)
+
+        for r, name in enumerate(args.runs):
+            pca2, ts, ts_res = emb[name]
+            scatter(axes[r, 0], pca2)
+            scatter(axes[r, 1], ts)
+            sc = axes[r, 2].scatter(ts[:, 0], ts[:, 1], s=16, c=age, cmap=age_cmap, linewidths=0.4,
+                                    edgecolors="white")
+            axes[r, 2].scatter(ts[is_ext, 0], ts[is_ext, 1], s=30, facecolors="none", edgecolors=ink,
+                               marker="^", linewidths=0.6)
+            scatter(axes[r, 3], ts_res)
+            cb = fig.colorbar(sc, ax=axes[r, 2], fraction=0.046, pad=0.02)
+            cb.set_label("age (months)", color=ink, fontsize=8)
+            cb.ax.tick_params(labelsize=7, colors=ink)
+            titles = [f"PCA (PC1 vs PC2), by {col}", f"t-SNE, by {col}", "t-SNE, by age",
+                      f"t-SNE after removing age, by {col}"]
+            for c, ax in enumerate(axes[r]):
+                ax.set_xticks([]); ax.set_yticks([])
+                for s_ in ax.spines.values():
+                    s_.set_color(grid)
+                if r == 0:
+                    ax.set_title(titles[c], fontsize=10, color=ink)
+            axes[r, 0].set_ylabel(name, fontsize=11, color=ink, fontweight="bold")
+
+        handles = [Line2D([], [], marker="^" if d in ext_only else "o", linestyle="", markersize=7,
+                          markerfacecolor=color[d], markeredgecolor=ink if d in ext_only else "white",
+                          label=d + ("  (external only)" if d in ext_only else "")) for d in order]
+        handles += [Line2D([], [], marker="o", linestyle="", markersize=7, markerfacecolor="white",
+                           markeredgecolor=ink, label="circle = internal scan"),
+                    Line2D([], [], marker="^", linestyle="", markersize=7, markerfacecolor="white",
+                           markeredgecolor=ink, label="triangle = external scan")]
+        ncol = min(len(handles), 4 if col == "scanner_key" else 7)
+        n_leg_rows = int(np.ceil(len(handles) / ncol))
+        fig_h = 3.6 * n + 1.2
+        fig.legend(handles=handles, loc="upper center", ncol=ncol, frameon=False, fontsize=9,
+                   labelcolor=ink, bbox_to_anchor=(0.5, 1.0))
+        leg_h = 0.1 + 0.24 * n_leg_rows                       # inches reserved for the legend
+        fig.set_size_inches(16, 3.6 * n + 0.4 + leg_h)
+        fig.tight_layout(rect=(0, 0, 1, 1 - leg_h / (3.6 * n + 0.4 + leg_h)))
+        path = Path(out_dir) / ("latent_plots.png" if col == "dataset" else f"latent_plots_{col}.png")
+        fig.savefig(path, dpi=150, facecolor="white")
+        plt.close(fig)
+        paths.append(path)
+        print(f"[plot] {path}")
+    return paths
 
 
 def analyze(args, df):
@@ -307,16 +496,37 @@ def analyze(args, df):
     out = Path(args.out_dir)
     idx = pd.read_csv(out / "latent_index.csv")
     met = pd.read_csv(out / "recon_metrics_per_scan.csv")
-    tr, te, ex = (idx.role == "train").values, (idx.role == "test").values, (idx.role == "external_tbi").values
+    tr, te = (idx.role == "train").values, (idx.role == "test").values
+    ext_roles = [r for r in EXTERNAL_ROLES if (idx.role == r).any()]
+    splits = ["test"] + ext_roles
     age = idx["age_bef_norm"].values.astype(float)
+    ba_fn = lambda f: balanced_accuracy_score(f["y"], f["pred"])
 
-    # reference: how well does AGE ALONE predict site? (sites cover different age ranges)
-    clf = LogisticRegression(max_iter=5000, class_weight="balanced").fit(age_basis(age[tr]), idx.dataset[tr])
-    te_df = idx[te].copy()
-    te_df["pred"] = clf.predict(age_basis(age[te]))
-    ba_fn = lambda f: balanced_accuracy_score(f["dataset"], f["pred"])
-    age_only = (ba_fn(te_df), subject_bootstrap(te_df, ba_fn, args.n_boot))
-    n_sites = idx.dataset[tr].nunique()
+    # probe targets: each --probe_labels column, restricted to classes with enough training scans;
+    # test scans of other classes are left out of that probe
+    probes = {}
+    for col in args.probe_labels:
+        if col not in idx.columns:
+            print(f"[probe] skip {col}: not a column")
+            continue
+        y = idx[col].astype(str)
+        cnt = y[tr].value_counts()
+        keep = set(cnt[cnt >= args.probe_min_count].index)
+        ok = y.isin(keep).values
+        if len(keep) < 2:
+            print(f"[probe] skip {col}: fewer than 2 classes with >= {args.probe_min_count} train scans")
+            continue
+        tag = "site" if col == "dataset" else ("scanner" if col == "scanner_key" else col)
+        probes[tag] = {"col": col, "y": y, "tr": tr & ok, "te": te & ok, "n": len(keep),
+                       "dropped": sorted(set(cnt.index) - keep)}
+
+    # reference: how well does AGE ALONE predict the label? (sites/scanners cover different age ranges)
+    age_only = {}
+    for tag, p in probes.items():
+        clf = LogisticRegression(max_iter=5000, class_weight="balanced").fit(age_basis(age[p["tr"]]), p["y"][p["tr"]])
+        f = idx[p["te"]].copy()
+        f["y"], f["pred"] = p["y"][p["te"]].values, clf.predict(age_basis(age[p["te"]]))
+        age_only[tag] = (ba_fn(f), subject_bootstrap(f, ba_fn, args.n_boot))
 
     rows, per_site_age, feats = [], [], {}
     for name in args.runs:
@@ -325,24 +535,32 @@ def analyze(args, df):
         feats[name] = (P, P_res)
 
         res = {"arm": name}
-        for tag, F in [("site_bacc", P), ("site_bacc_age_resid", P_res)]:
-            clf = LogisticRegression(max_iter=5000, class_weight="balanced", C=1.0).fit(F[tr], idx.dataset[tr])
-            f = idx[te].copy()
-            f["pred"] = clf.predict(F[te])
-            res[tag] = (ba_fn(f), subject_bootstrap(f, ba_fn, args.n_boot))
+        for tag, p in probes.items():
+            for suffix, F in [("bacc", P), ("bacc_age_resid", P_res)]:
+                clf = LogisticRegression(max_iter=5000, class_weight="balanced", C=1.0).fit(F[p["tr"]],
+                                                                                             p["y"][p["tr"]])
+                f = idx[p["te"]].copy()
+                f["y"], f["pred"] = p["y"][p["te"]].values, clf.predict(F[p["te"]])
+                res[f"{tag}_{suffix}"] = (ba_fn(f), subject_bootstrap(f, ba_fn, args.n_boot))
 
         ridge = RidgeCV(alphas=np.logspace(-2, 4, 13)).fit(P[tr], age[tr])
-        for tag, mask in [("age_mae_test", te), ("age_mae_external", ex)]:
+        for split in splits:
+            mask = (idx.role == split).values
+            # 'age_mae_external' keeps its old name for the TBI cohorts (plot scripts use it)
+            tag = "age_mae_test" if split == "test" else ("age_mae_external" if split == "external_tbi"
+                                                          else f"age_mae_{split}")
             f = idx[mask].copy()
             f["err"] = np.abs(ridge.predict(P[mask]) - age[mask])
             res[tag] = (f["err"].mean(), subject_bootstrap(f, lambda g: g["err"].mean(), args.n_boot))
             for d, g in f.groupby("dataset"):
-                per_site_age.append({"arm": name, "split": tag.split("_")[-1], "dataset": d,
+                per_site_age.append({"arm": name, "split": split, "dataset": d,
                                      "n": len(g), "age_mae_months": g["err"].mean()})
 
         for metric in ["l1", "ssim", "psnr"]:
-            for split in ["test", "external_tbi"]:
+            for split in splits:
                 f = met[(met.arm == name) & (met.role == split)]
+                if f.empty:
+                    continue
                 res[f"{metric}_{split}"] = (f[metric].mean(),
                                             subject_bootstrap(f, lambda g, m=metric: g[m].mean(), args.n_boot))
         rows.append(res)
@@ -357,7 +575,7 @@ def analyze(args, df):
                             for r in rows])
     numeric.to_csv(out / "summary_numeric.csv", index=False)
 
-    per_site_rec = (met[met.role.isin(["test", "external_tbi"])]
+    per_site_rec = (met[met.role.isin(splits)]
                     .groupby(["arm", "role", "dataset"])[["l1", "ssim", "psnr"]].mean().round(4))
     per_site_rec.to_csv(out / "recon_per_site.csv")
     per_site_age = pd.DataFrame(per_site_age)
@@ -367,12 +585,12 @@ def analyze(args, df):
     tests = []
     ref = args.reference
     if len(args.runs) > 1:
-        for split in ["test", "external_tbi"]:
-            base = met[(met.arm == ref) & (met.role == split)].set_index("image_uid")
+        for split in splits:
+            base = met[(met.arm == ref) & (met.role == split)].set_index("scan_id")
             for name in args.runs:
                 if name == ref:
                     continue
-                other = met[(met.arm == name) & (met.role == split)].set_index("image_uid").loc[base.index]
+                other = met[(met.arm == name) & (met.role == split)].set_index("scan_id").loc[base.index]
                 for metric in ["l1", "ssim"]:
                     d = other[metric] - base[metric]
                     tests.append({"split": split, "arm": name, "metric": metric,
@@ -380,38 +598,63 @@ def analyze(args, df):
                                   "wilcoxon_p": wilcoxon(d).pvalue if len(d) > 1 and d.abs().sum() > 0 else np.nan})
         pd.DataFrame(tests).to_csv(out / f"paired_vs_{ref}.csv", index=False)
 
-    plot_path = out / "latent_plots.png"
+    # mTBI vs control-like from the external TBI cohorts' latents
+    grp = None
+    if not args.no_group_probe and "external_tbi" in ext_roles:
+        grp = group_probe(args, idx, feats)
+        if grp is not None and len(grp):
+            grp.to_csv(out / "group_probe.csv", index=False)
+
+    plot_paths = []
     if not args.no_plots:
-        plot_latents(args, idx, feats, plot_path)
+        plot_paths = plot_latents(args, idx, feats, out)
 
     with open(out / "eval_config.json", "w") as f:
         json.dump({"ckpt": args.ckpt, "runs": args.runs, "reference": ref, "n_pcs": args.n_pcs,
-                   "n_boot": args.n_boot, "max_per_role": args.max_per_role,
-                   "site_from_age_only": age_only[0]}, f, indent=2)
+                   "n_boot": args.n_boot, "max_per_role": args.max_per_role, "splits": splits,
+                   **{f"{t}_from_age_only": v[0] for t, v in age_only.items()},
+                   **{f"{t}_from_age_only_ci": list(v[1]) for t, v in age_only.items()},
+                   **{f"{t}_chance": 1 / p["n"] for t, p in probes.items()},
+                   **{f"{t}_probe_dropped_classes": p["dropped"] for t, p in probes.items()}}, f, indent=2)
+    pd.DataFrame([{"probe": t, "label": p["col"], "n_classes": p["n"], "chance": 1 / p["n"],
+                   "from_age_only": fmt(*age_only[t]), "dropped_classes": "; ".join(p["dropped"])}
+                  for t, p in probes.items()]).to_csv(out / "probe_reference.csv", index=False)
 
-    pd.set_option("display.width", 250, "display.max_columns", 30)
-    print(f"\nSite probe chance = {1 / n_sites:.3f}; site from AGE ONLY = {fmt(*age_only)}")
+    pd.set_option("display.width", 250, "display.max_columns", 40)
+    for t, p in probes.items():
+        print(f"\n{t} probe ({p['col']}): {p['n']} classes, chance = {1 / p['n']:.3f}; "
+              f"from AGE ONLY = {fmt(*age_only[t])}" + (f"; dropped {p['dropped']}" if p["dropped"] else ""))
     print(table.to_string(index=False))
     print("\nReconstruction per site:\n", per_site_rec.to_string())
     if tests:
         print(f"\nPaired vs {ref}:\n", pd.DataFrame(tests).round(4).to_string(index=False))
+    if grp is not None and len(grp):
+        print(f"\nmTBI ({'/'.join(args.group_case)}) vs control-like ({'/'.join(args.group_control)}), "
+              f"{args.group_folds}-fold CV x {args.group_repeats}, {args.group_n_pcs} PCs; "
+              f"[lo, hi] = spread over CV repeats; p = within-cohort permutation ({args.group_n_perm}x):")
+        print(grp.round(3).to_string(index=False))
 
     if args.wandb:
         import wandb
         wandb.init(project=args.wandb_project, name=args.wandb_name or Path(args.out_dir).name,
-                   job_type="eval", config={**vars(args), "site_from_age_only": age_only[0]})
+                   job_type="eval",
+                   config={**vars(args), **{f"{t}_from_age_only": v[0] for t, v in age_only.items()}})
         log = {"summary": wandb.Table(dataframe=table),
                "summary_numeric": wandb.Table(dataframe=numeric),
                "recon_per_site": wandb.Table(dataframe=per_site_rec.reset_index()),
                "age_probe_per_site": wandb.Table(dataframe=per_site_age)}
         if tests:
             log["paired_vs_reference"] = wandb.Table(dataframe=pd.DataFrame(tests))
-        if plot_path.exists() and not args.no_plots:
-            log["latent_plots"] = wandb.Image(str(plot_path))
+        if grp is not None and len(grp):
+            log["group_probe"] = wandb.Table(dataframe=grp)
+        for pth in plot_paths:
+            log[pth.stem] = wandb.Image(str(pth))
         wandb.log(log)
         for _, r in numeric.iterrows():   # headline numbers per run, visible in the runs table
-            for k in ["site_bacc_age_resid", "age_mae_test", "ssim_test", "ssim_external_tbi"]:
-                wandb.run.summary[f"{r['arm']}/{k}"] = r[k]
+            for k in ["site_bacc_age_resid", "scanner_bacc_age_resid", "age_mae_test",
+                      "ssim_test", "ssim_external_tbi", "ssim_external_hc"]:
+                if k in r:
+                    wandb.run.summary[f"{r['arm']}/{k}"] = r[k]
         wandb.finish()
 
 
@@ -436,11 +679,30 @@ if __name__ == "__main__":
                     help="write input + reconstruction NIfTIs for these roles, e.g. test external_tbi")
     ap.add_argument("--save_recon_runs", nargs="*", default=None,
                     help="only write reconstructions for these runs (default: all)")
-    ap.add_argument("--metric_roles", nargs="*", default=["val", "test", "external_tbi"],
+    ap.add_argument("--metric_roles", nargs="*", default=["val", "test"] + EXTERNAL_ROLES,
                     help="roles that get reconstruction metrics (train scans are only encoded)")
+    ap.add_argument("--probe_labels", nargs="*", default=["dataset", "scanner_key"],
+                    help="columns to probe for (dataset -> site_*, scanner_key -> scanner_*)")
+    ap.add_argument("--probe_min_count", default=8, type=int,
+                    help="probe classes need at least this many training scans (same rule as training)")
+    # mTBI vs control-like probe on the external TBI cohorts
+    ap.add_argument("--no_group_probe", action="store_true")
+    ap.add_argument("--group_col", default="group_raw")
+    ap.add_argument("--group_case", nargs="+", default=["mTBI", "patient"], help="labels of the pathology class")
+    ap.add_argument("--group_control", nargs="+", default=["CC", "OI", "control"],
+                    help="labels merged into the control class (orthopedic injuries count as controls)")
+    ap.add_argument("--group_n_pcs", default=20, type=int, help="first PCs used (small n: keep this low)")
+    ap.add_argument("--group_C", default=0.1, type=float, help="logistic regression inverse L2 strength")
+    ap.add_argument("--group_folds", default=5, type=int)
+    ap.add_argument("--group_repeats", default=20, type=int)
+    ap.add_argument("--group_n_perm", default=500, type=int, help="0 = no permutation test")
+    ap.add_argument("--group_min_per_class", default=8, type=int,
+                    help="an analysis needs at least this many scans per class")
     ap.add_argument("--progress_every", default=100, type=int,
                     help="save progress every N scans so an interrupted run can resume (0 = off)")
     ap.add_argument("--no_plots", action="store_true")
+    ap.add_argument("--plot_color_by", nargs="*", default=["dataset", "manufacturer", "scanner_key"],
+                    help="one latent-plot figure per column (dataset -> latent_plots.png)")
     ap.add_argument("--wandb", action="store_true", help="log tables and plots to W&B")
     ap.add_argument("--wandb_project", default="ae-midl-eval")
     ap.add_argument("--wandb_name", default=None)
@@ -453,6 +715,15 @@ if __name__ == "__main__":
 
     df = pd.read_csv(args.dataset_csv)
     df = df[df.role.isin(ROLES)].reset_index(drop=True)
+    # unique per-scan id for file names and pairing (some image_uids repeat across datasets)
+    dup = df.image_uid.duplicated(keep=False)
+    df["scan_id"] = df.image_uid.astype(str).where(~dup, df.dataset + "__" + df.image_uid.astype(str))
+    if dup.any():
+        print(f"[ids] {dup.sum()} scans share an image_uid with another dataset -> scan_id = <dataset>__<uid>")
+    if not df.scan_id.is_unique:
+        raise ValueError("image_uid repeats within a dataset: "
+                         f"{df.loc[df.scan_id.duplicated(), 'scan_id'].head().tolist()}")
+    print("[roles]", df.role.value_counts().to_dict())
     if args.max_per_role:
         keep = np.concatenate([g.sample(min(len(g), args.max_per_role), random_state=0).index.values
                                for _, g in df.groupby("role")])

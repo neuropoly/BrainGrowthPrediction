@@ -435,8 +435,13 @@ if __name__ == '__main__':
 
     train_tf = transforms.Compose(base_transforms() + (site_augmentations(args.aug_p) if use_aug else no_aug()))
     val_tf = transforms.Compose(base_transforms())
-    trainset = RetryCacheReads(get_dataset_from_pd(ae_train_df, train_tf, args.cache_dir))
-    valset = RetryCacheReads(get_dataset_from_pd(ae_val_df, val_tf, args.cache_dir))
+    # Only the columns the loop uses go into the dataset. The splits CSV also has metadata columns that
+    # are text for some scans and empty (NaN = float) for others (scanner_model, coil, ...); the default
+    # collate cannot batch [nan, "32ch"] and crashes. A fixed column set also keeps the MONAI cache keys
+    # stable when metadata columns are added to the CSV later.
+    DS_COLS = ["image_uid", "image_path", "site", "age_in"]
+    trainset = RetryCacheReads(get_dataset_from_pd(ae_train_df[DS_COLS].copy(), train_tf, args.cache_dir))
+    valset = RetryCacheReads(get_dataset_from_pd(ae_val_df[DS_COLS].copy(), val_tf, args.cache_dir))
 
     sampler_gen = None
     if args.sample_weight == "none":
