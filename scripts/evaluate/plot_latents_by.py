@@ -49,13 +49,13 @@ INK, GRID, MISSING = "#3d3d3a", "#e4e3dd", "#c9c8c2"
 def read_headers(idx, path_col, cache):
     if cache.exists():
         h = pd.read_csv(cache)
-        if set(idx.image_uid) <= set(h.image_uid):
+        if "image_path" in h.columns and set(idx[path_col]) <= set(h.image_path):
             return h
     import nibabel as nib
     from tqdm import tqdm
     rows = []
     for uid, p in tqdm(zip(idx.image_uid, idx[path_col]), total=len(idx), desc="headers"):
-        r = {"image_uid": uid}
+        r = {"image_path": p}
         try:
             img = nib.load(p)
             z = np.array(img.header.get_zooms()[:3], dtype=float)
@@ -228,6 +228,8 @@ def main():
 
     out = Path(args.out_dir)
     idx = pd.read_csv(out / "latent_index.csv")
+    n_lat = len(idx)
+    idx["_row"] = np.arange(n_lat)          # row i of latent_index = row i of latents_<run>.npy
     cfg_path = out / "eval_config.json"
     runs = args.runs or (list(json.load(open(cfg_path))["runs"]) if cfg_path.exists()
                          else sorted(p.stem[len("latents_"):] for p in out.glob("latents_*.npy")))
@@ -239,8 +241,17 @@ def main():
         idx = merge_table(idx, pd.read_csv(args.extra_csv), "extra")
     if any(c in HEADER_COLS and c not in idx.columns for c in args.color_by):
         h = read_headers(idx, args.path_col, out / f"header_info_{args.path_col}.csv")
-        idx = idx.merge(h.drop(columns=[c for c in h.columns if c in idx.columns and c != "image_uid"]),
-                        on="image_uid", how="left")
+        h = h.drop_duplicates("image_path").rename(columns={"image_path": "_hdr_path"})
+        h = h.drop(columns=[c for c in h.columns if c in idx.columns])
+        idx = idx.merge(h, left_on=args.path_col, right_on="_hdr_path", how="left").drop(columns="_hdr_path")
+    # every merge must keep exactly one row per latent, in the latent order
+    if len(idx) != n_lat:
+        print(f"[merge] {len(idx) - n_lat} extra rows from a many-to-one key (shared image_uid?) -> "
+              f"keeping the first match per scan")
+        idx = idx.drop_duplicates("_row")
+    idx = idx.sort_values("_row").reset_index(drop=True)
+    if len(idx) != n_lat or not (idx["_row"].values == np.arange(n_lat)).all():
+        sys.exit(f"latent_index has {n_lat} rows but the merged table has {len(idx)}: cannot align with the latents")
     idx.to_csv(out / "latent_index_with_metadata.csv", index=False)
 
     variables = []
