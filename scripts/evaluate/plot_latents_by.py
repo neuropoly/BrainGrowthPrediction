@@ -208,7 +208,8 @@ def main():
                          "res, inplane_mm, slice_mm, aniso, vox_vol, dim, orient, field_T, vendor, model, "
                          "scanner, software, coil, institution")
     ap.add_argument("--extra_csv", default=None, help="extra variables, merged on image_uid/subject_id/dataset")
-    ap.add_argument("--roles", nargs="+", default=["val", "test", "external_tbi"], help="scans shown in plots")
+    ap.add_argument("--roles", nargs="+", default=["val", "test", "external_tbi", "external_hc"],
+                    help="scans shown in plots (roles absent from the run are ignored)")
     ap.add_argument("--as_category", nargs="*", default=[], help="treat these numeric columns as categories")
     ap.add_argument("--max_levels", default=8, type=int, help="rarer categories are merged into 'other'")
     ap.add_argument("--n_pcs", default=50, type=int)
@@ -256,15 +257,17 @@ def main():
 
     def is_cat(v):
         s = idx[v]
-        return v in args.as_category or s.dtype == object or s.nunique(dropna=True) <= args.max_levels
+        return (v in args.as_category or not pd.api.types.is_numeric_dtype(s)
+                or s.nunique(dropna=True) <= args.max_levels)
 
     tr, te = (idx.role == "train").values, (idx.role == "test").values
     age = idx["age_bef_norm"].values.astype(float)
     site = idx["dataset"].astype(str).values
     show = idx.role.isin(args.roles).values
     sub = idx[show].reset_index(drop=True)
-    internal = sorted(idx.loc[idx.role != "external_tbi", "dataset"].astype(str).unique())
-    external = sorted(set(idx.loc[idx.role == "external_tbi", "dataset"].astype(str)) - set(internal))
+    ext_mask = idx.role.isin(["external_tbi", "external_hc"])          # v1: external_tbi only; v2: + external_hc
+    internal = sorted(idx.loc[~ext_mask, "dataset"].astype(str).unique())
+    external = sorted(set(idx.loc[ext_mask, "dataset"].astype(str)) - set(internal))
     marker = {d: MARKERS[i % len(MARKERS)] for i, d in enumerate(internal + external)}
     perplexity = max(5, min(30, (len(sub) - 1) // 3))
 
