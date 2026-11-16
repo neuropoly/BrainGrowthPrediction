@@ -25,7 +25,8 @@
 set -euo pipefail
 
 # ======================= EDIT THESE ==========================================
-EVAL_DIR=/home/andim/BrainGrowthPrediction/scripts/analyze
+EVAL_DIR=/home/andim/BrainGrowthPrediction/scripts/evaluate
+ANALY_DIR=/home/andim/BrainGrowthPrediction/scripts/analyze
 #   needs: plot_eval_results.py, dice_recon.py, plot_latents_by.py, eval_autoencoder.py (new versions)
 FOLDERS=(
   "$HOME/scratch/bgp/eval_all8"          # v1 main
@@ -95,7 +96,7 @@ PY
 
   # ---- 2. figures ---------------------------------------------------------------------
   for EXCL in "" frozen_pretrained; do
-    python "$EVAL_DIR/plot_eval_results.py" \
+    python "$ANALY_DIR/plot_eval_results.py" \
       --eval_dir "$E" \
       --dice_dir "$DICE_DIR" \
       --out_dir "$E/figures${EXCL:+_no_frozen}" \
