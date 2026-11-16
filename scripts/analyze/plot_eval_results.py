@@ -49,7 +49,22 @@ SEG_NAMES = {1: "GM", 2: "WM", 3: "CSF", 4: "CSFv", 5: "cerGM", 6: "Thal", 7: "P
              10: "Accu", 11: "Amyg", 12: "Hippo"}
 SEG_COLORS = ["#9e9ac8", "#f0f0f0", "#6baed6", "#2171b5", "#c994c7", "#fd8d3c", "#e6550d", "#31a354",
               "#fdd0a2", "#de2d26", "#ffd92f", "#8c6d31"]
-INK, MUTED, GRID, BG, BAND = "#2b2b29", "#6b6a65", "#e8e7e1", "#faf9f6", "#e3e2dc"
+INK, MUTED, GRID, BG, BAND = "#2b2b29", "#6b6a65", "#e6e6e6", "#ffffff", "#e9e9e9"
+EX_BG, EX_TXT, EX_MUTED = "white", "#2b2b29", "#6b6a65"      # image-examples figure (panels stay black)
+
+
+def set_theme(dark):
+    """light: white background, dark text (paper). dark: black background, white text (slides)."""
+    global INK, MUTED, GRID, BG, BAND, EX_BG, EX_TXT, EX_MUTED
+    if dark:
+        INK, MUTED, GRID, BG, BAND = "#f2f2f2", "#b5b5b5", "#3a3a3a", "#000000", "#2a2a2a"
+        EX_BG, EX_TXT, EX_MUTED = "black", "white", "#bbbbbb"
+    else:
+        INK, MUTED, GRID, BG, BAND = "#2b2b29", "#6b6a65", "#e6e6e6", "#ffffff", "#e9e9e9"
+        EX_BG, EX_TXT, EX_MUTED = "white", "#2b2b29", "#6b6a65"
+    plt.rcParams.update({"text.color": INK, "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
+                         "axes.edgecolor": GRID, "figure.facecolor": BG, "axes.facecolor": BG,
+                         "savefig.facecolor": BG, "legend.labelcolor": INK})
 HIGHER_BETTER = ("ssim", "psnr", "dice")
 
 
@@ -96,29 +111,36 @@ def save(fig, path):
     print(f"[plot] {path}")
 
 
-def ci_panel(ax, d, metric, higher, box_w=0.62, sort=True, refs=()):
-    """d: DataFrame with arm, v, lo, hi. Box = CI, line = estimate. refs: [(value, label, linestyle)]"""
-    d = d.sort_values("v", ascending=higher) if sort else d
-    for i, r in enumerate(d.itertuples()):
+def ci_panel(ax, d, metric, higher, box_w=0.62, sort=True, refs=(), show_labels=True):
+    """Horizontal forest-style panel. d: arm, v, lo, hi. Box = CI, line = estimate.
+    sort=True: best model at the top; sort=False: d's order, first row at the top.
+    refs: [(value, label, linestyle)] drawn as vertical reference lines."""
+    if sort:
+        d = d.sort_values("v", ascending=higher)          # worst first -> bottom; best last -> top
+        ys = np.arange(len(d))
+    else:
+        ys = np.arange(len(d))[::-1]                      # keep the given order, top to bottom
+    for y, r in zip(ys, d.itertuples()):
         _, line, box = GROUPS[group_of(r.arm)]
-        ax.add_patch(plt.Rectangle((i - box_w / 2, r.lo), box_w, r.hi - r.lo, facecolor=box,
+        ax.add_patch(plt.Rectangle((r.lo, y - box_w / 2), r.hi - r.lo, box_w, facecolor=box,
                                    edgecolor=line, linewidth=0.6, alpha=0.85, zorder=2))
-        ax.plot([i - box_w / 2, i + box_w / 2], [r.v, r.v], color=line, lw=2.2, zorder=3, solid_capstyle="butt")
+        ax.plot([r.v, r.v], [y - box_w / 2, y + box_w / 2], color=line, lw=2.2, zorder=3, solid_capstyle="butt")
     lo, hi = d.lo.min(), d.hi.max()
     for v, lab, ls in refs:
         if v is None or not np.isfinite(v):
             continue
-        ax.axhline(v, color=MUTED, lw=1, ls=ls, zorder=1)
-        ax.text(len(d) - 0.45, v, f" {lab}", va="center", ha="left", fontsize=7, color=MUTED)
+        ax.axvline(v, color=MUTED, lw=1, ls=ls, zorder=1)
+        ax.text(v, len(d) - 0.45, f" {lab}", va="bottom", ha="left", fontsize=7, color=MUTED)
         lo, hi = min(lo, v), max(hi, v)
     pad = 0.08 * (hi - lo if hi > lo else 1)
-    ax.set_xlim(-0.6, len(d) - 0.4)
-    ax.set_ylim(lo - pad, hi + pad)
-    ax.set_xticks(range(len(d)))
-    ax.set_xticklabels(d.arm, rotation=40, ha="right", rotation_mode="anchor", fontsize=7.5, color=INK)
-    ax.grid(axis="y", color=GRID, lw=0.8, zorder=0)
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(-0.6, len(d) - 0.4 + (0.5 if refs else 0))
+    ax.set_yticks(ys)
+    ax.set_yticklabels(d.arm if show_labels else [], fontsize=7.5, color=INK)
+    ax.grid(axis="x", color=GRID, lw=0.8, zorder=0)
     ax.set_axisbelow(True)
-    style(ax, metric, "↑ higher is better" if higher else "↓ lower is better")
+    style(ax, metric, "→ higher is better" if higher else "← lower is better")
+    ax.spines["bottom"].set_visible(True)
 
 
 def group_legend(fig, arms, y=1.0):
@@ -152,7 +174,8 @@ def fig_summary(E, out, exclude):
         rows.append([m for m in metrics if m.startswith(base + "_")])
     rows = [r for r in rows if r]
     ncol = max(len(r) for r in rows)
-    fig, axes = plt.subplots(len(rows), ncol, figsize=(4.6 * ncol, 3.6 * len(rows) + 0.8), squeeze=False,
+    ph = 0.3 * len(num) + 1.1                              # panel height grows with the number of models
+    fig, axes = plt.subplots(len(rows), ncol, figsize=(4.4 * ncol + 1.2, ph * len(rows) + 0.8), squeeze=False,
                              facecolor=BG)
     for ri, row in enumerate(rows):
         for ci in range(ncol):
@@ -166,10 +189,11 @@ def fig_summary(E, out, exclude):
                 t = m.split("_bacc")[0]
                 refs = [(cfg.get(f"{t}_chance"), "chance", "--"), (cfg.get(f"{t}_from_age_only"), "age only", ":")]
             ci_panel(ax, d, m, higher_is_better(m), refs=refs)
-    top = 1 - 0.9 / (3.6 * len(rows) + 0.8)          # ~0.9 inch for legend + subtitle
+    H = ph * len(rows) + 0.8
+    top = 1 - 0.9 / H                                      # ~0.9 inch for legend + subtitle
     group_legend(fig, num.arm, y=1.0)
-    fig.text(0.5, 1 - 0.45 / (3.6 * len(rows) + 0.8), "Box = 95% CI (subject bootstrap), line = estimate · arms "
-             "ordered worst → best (best on the right) · probes: lower = more invariant",
+    fig.text(0.5, 1 - 0.45 / H, "Box = 95% CI (subject bootstrap), line = estimate · models ordered "
+             "worst → best (best at the top) · probes: lower = more invariant",
              ha="center", va="top", fontsize=9, color=MUTED)
     fig.tight_layout(rect=(0, 0, 1, top))
     save(fig, out / "fig_summary_ci.png")
@@ -229,7 +253,7 @@ def fig_generalization(E, out, exclude, metrics, k, n_boot):
                     continue
                 e = e.iloc[0]
                 ax.plot([e.gap_lo, e.gap_hi], [y + o, y + o], color=ecol[d], lw=1.5, zorder=2)
-                ax.scatter(e.gap, y + o, color=ecol[d], marker=emark[d], s=36, zorder=3, edgecolors="white",
+                ax.scatter(e.gap, y + o, color=ecol[d], marker=emark[d], s=36, zorder=3, edgecolors=BG,
                            linewidths=0.6)
             if y > 0 and group_of(arm) != group_of(arms[y - 1]):
                 ax.axhline(y - 0.5, color=GRID, lw=1)
@@ -264,36 +288,39 @@ def fig_dice_summary(D, out, exclude):
     if gap is not None:
         gap = gap[~gap.arm.isin(exclude)]
     n = len(roles) + (gap is not None and len(gap) > 0)
-    fig, axes = plt.subplots(1, n, figsize=(4.8 * n, 4.4), squeeze=False, facecolor=BG)
-    ylo = s.mean_dice_lo.min(); yhi = s.mean_dice_hi.max()
+    fig, axes = plt.subplots(1, n, figsize=(4.2 * n + 1.2, 0.3 * len(arms) + 1.6), squeeze=False, facecolor=BG)
+    xlo = s.mean_dice_lo.min(); xhi = s.mean_dice_hi.max()
     for i, role in enumerate(roles):
-        g = s[s.role == role].set_index("arm").reindex(arms).dropna(subset=["mean_dice"]).reset_index()
-        d = pd.DataFrame({"arm": g.arm, "v": g.mean_dice, "lo": g.mean_dice_lo, "hi": g.mean_dice_hi})
-        ci_panel(axes[0, i], d, f"mean Dice · {ROLE_STYLE[role][0]}", True, sort=False)
-        axes[0, i].set_ylim(ylo - 0.01, yhi + 0.01)          # same scale across roles
+        g = s[s.role == role].set_index("arm").reindex(arms).reset_index()
+        d = pd.DataFrame({"arm": g.arm, "v": g.mean_dice, "lo": g.mean_dice_lo, "hi": g.mean_dice_hi}).fillna(np.nan)
+        ci_panel(axes[0, i], d.dropna(), f"mean Dice · {ROLE_STYLE[role][0]}", True, sort=False,
+                 show_labels=(i == 0))
+        axes[0, i].set_xlim(xlo - 0.01, xhi + 0.01)          # same scale across roles
     if gap is not None and len(gap):
         ax = axes[0, -1]
         ext = [r for r in ["external_tbi", "external_hc"] if r in set(gap.role)]
-        off = np.linspace(-0.18, 0.18, len(ext)) if len(ext) > 1 else [0]
-        for x, arm in enumerate(arms):
+        off = np.linspace(0.18, -0.18, len(ext)) if len(ext) > 1 else [0]
+        for k, arm in enumerate(arms):
+            y = len(arms) - 1 - k                           # same top-to-bottom order as the other panels
             for o, role in zip(off, ext):
                 r = gap[(gap.arm == arm) & (gap.role == role)]
                 if r.empty:
                     continue
                 r = r.iloc[0]
                 _, col, mk = ROLE_STYLE[role]
-                ax.plot([x + o, x + o], [r.lo, r.hi], color=col, lw=1.6)
-                ax.scatter(x + o, r.dice_gap_vs_test, color=col, marker=mk, s=34, zorder=3, edgecolors="white")
-        ax.axhline(0, color=INK, lw=1)
-        ax.set_xticks(range(len(arms)))
-        ax.set_xticklabels(arms, rotation=40, ha="right", rotation_mode="anchor", fontsize=7.5)
-        ax.grid(axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True)
-        style(ax, "external − internal mean Dice", "below 0 = worse on unseen sites")
+                ax.plot([r.lo, r.hi], [y + o, y + o], color=col, lw=1.6)
+                ax.scatter(r.dice_gap_vs_test, y + o, color=col, marker=mk, s=34, zorder=3, edgecolors=BG)
+        ax.axvline(0, color=INK, lw=1)
+        ax.set_yticks(range(len(arms))); ax.set_yticklabels([])
+        ax.set_ylim(-0.6, len(arms) - 0.4)
+        ax.grid(axis="x", color=GRID, lw=0.8); ax.set_axisbelow(True)
+        style(ax, "external − internal mean Dice", "left of 0 = worse on unseen sites")
         ax.legend(handles=[Line2D([], [], color=ROLE_STYLE[r][1], marker=ROLE_STYLE[r][2], ls="",
                                   label=ROLE_STYLE[r][0]) for r in ext], frameon=False, fontsize=8,
                   loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=len(ext))
-    group_legend(fig, arms, y=1.06)
-    fig.tight_layout()
+    H = fig.get_size_inches()[1]
+    group_legend(fig, arms, y=1.0)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.45 / H))       # ~0.45 inch reserved for the legend
     save(fig, out / "fig_dice_summary.png")
 
 
@@ -356,7 +383,7 @@ def fig_dice_regions(D, out, exclude, n_boot):
                 rgba = im.cmap(im.norm(M[a, g]))
                 lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
                 txt = f"{M[a, g]:+.2f}" if kind == "div" else f"{M[a, g]:.2f}".lstrip("0")
-                ax.text(g, a, txt, ha="center", va="center", fontsize=6.3, color="white" if lum < 0.5 else INK)
+                ax.text(g, a, txt, ha="center", va="center", fontsize=6.3, color="white" if lum < 0.5 else "#2b2b29")
         ax.set_xticks(range(len(regions))); ax.set_xticklabels(regions, rotation=45, ha="right", fontsize=8)
         ax.set_yticks(range(len(arms))); ax.set_yticklabels(arms if i % ncol == 0 else [], fontsize=8)
         x = -0.5
@@ -386,7 +413,7 @@ def fig_dice_regions(D, out, exclude, n_boot):
                 r = T.loc[(arm, role, reg)]
                 _, col, mk = ROLE_STYLE[role]
                 ax.plot([r.lo, r.hi], [y + o, y + o], color=col, lw=1.2)
-                ax.scatter(r["mean"], y + o, color=col, marker=mk, s=18, zorder=3, edgecolors="white", linewidths=0.4)
+                ax.scatter(r["mean"], y + o, color=col, marker=mk, s=18, zorder=3, edgecolors=BG, linewidths=0.4)
             if y > 0 and group_of(arm) != group_of(arms[y - 1]):
                 ax.axhline(y - 0.5, color=GRID, lw=0.8)
         ax.set_yticks(range(len(arms)))
@@ -522,7 +549,7 @@ def fig_examples(E, D, out, arm, roles, seg_suffix, views):
         cols += ["SiamSeg(input)", "SiamSeg(recon)"]
     seg_cmap = ListedColormap(SEG_COLORS)
     nrow, ncol = len(picks) * len(views), len(cols)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(2.6 * ncol, 2.75 * nrow + 0.6), squeeze=False, facecolor="black")
+    fig, axes = plt.subplots(nrow, ncol, figsize=(2.6 * ncol, 2.75 * nrow + 0.6), squeeze=False, facecolor=EX_BG)
     sel = []
     for pi, (tag, sid, val) in enumerate(picks):
         r = man.loc[sid]
@@ -557,24 +584,25 @@ def fig_examples(E, D, out, arm, roles, seg_suffix, views):
                     ax.imshow(lab, cmap=seg_cmap, vmin=0.5, vmax=len(SEG_COLORS) + 0.5, alpha=0.6,
                               interpolation="nearest")
                 else:
+                    ax.set_facecolor("black")
                     ax.text(0.5, 0.5, "no segmentation", color="white", ha="center", va="center",
                             transform=ax.transAxes, fontsize=8)
                 if row == 0:
-                    ax.set_title(cols[c], color="white", fontsize=10)
+                    ax.set_title(cols[c], color=EX_TXT, fontsize=10)
             if vi == 0:
                 axes[row, 0].set_ylabel(f"{tag}\n{short_ds(r.dataset)} · {age:.0f} mo\n{val}"
                                         + (f"\nSSIM {ssim:.3f}" if "Dice" in tag and np.isfinite(ssim) else ""),
-                                        color="white", fontsize=8.5, rotation=0, ha="right", va="center", labelpad=8)
+                                        color=EX_TXT, fontsize=8.5, rotation=0, ha="right", va="center", labelpad=8)
             elif len(views) > 1:
-                axes[row, 0].set_ylabel(view, color="#bbbbbb", fontsize=8, rotation=0, ha="right", va="center")
+                axes[row, 0].set_ylabel(view, color=EX_MUTED, fontsize=8, rotation=0, ha="right", va="center")
     if show_seg:
         h = [Patch(color=SEG_COLORS[i - 1], label=n) for i, n in SEG_NAMES.items()]
-        fig.legend(handles=h, loc="lower center", ncol=12, frameon=False, fontsize=7.5, labelcolor="white",
+        fig.legend(handles=h, loc="lower center", ncol=12, frameon=False, fontsize=7.5, labelcolor=EX_TXT,
                    bbox_to_anchor=(0.5, 0.0))
     fig.suptitle(f"{arm}: best and worst reconstructions (saved test/external scans) · error colour scale 0–0.25",
-                 color="white", fontsize=11, y=0.995)
+                 color=EX_TXT, fontsize=11, y=0.995)
     fig.tight_layout(rect=(0.08, 0.03 if show_seg else 0, 1, 0.975))
-    fig.savefig(out / "fig_examples.png", dpi=180, facecolor="black", bbox_inches="tight")
+    fig.savefig(out / "fig_examples.png", dpi=180, facecolor=EX_BG, bbox_inches="tight")
     plt.close(fig)
     pd.DataFrame(sel).to_csv(out / "examples_selected.csv", index=False)
     print(f"[plot] {out / 'fig_examples.png'}")
@@ -594,7 +622,10 @@ def main():
     ap.add_argument("--example_roles", nargs="*", default=["test", "external_tbi", "external_hc"])
     ap.add_argument("--example_views", nargs="*", default=["axial"], choices=["axial", "coronal", "sagittal"])
     ap.add_argument("--seg_suffix", default="_siamseg")
+    ap.add_argument("--theme", default="light", choices=["light", "dark"],
+                    help="light = white background, dark text (paper); dark = black background, white text (slides)")
     args = ap.parse_args()
+    set_theme(args.theme == "dark")
 
     E = Path(args.eval_dir)
     D = Path(args.dice_dir) if args.dice_dir else E / "dice"
