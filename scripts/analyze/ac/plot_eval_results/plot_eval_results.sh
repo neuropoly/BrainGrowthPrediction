@@ -39,7 +39,7 @@ FOLDERS=(
   "$HOME/scratch/bgp/eval_masivar_all"   # v1, all MASiVar (MASiVar has role external_tbi here)
   # "$HOME/scratch/bgp/eval_all8_v2"     # v2, once it exists
 )
-SPLITS_CSV=/home/andim/projects/def-bedelb/andim/brlp-data/splits/datasets_splits.csv   # for manufacturer / scanner_key
+SPLITS_CSV=/home/andim/projects/def-bedelb/andim/brlp-data/splits_final/datasets_splits.csv   # NEW splits: scanner_key, manufacturer, group_raw
 EXAMPLE_ARM=baseline_pre        # model shown in fig_examples.png (empty = best test SSIM)
 SEG_SUFFIX=_siamseg
 REFERENCE=baseline_scratch

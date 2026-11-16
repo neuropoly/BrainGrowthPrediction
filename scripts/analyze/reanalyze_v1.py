@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--src", required=True, help="v1 eval folder")
     ap.add_argument("--dst", required=True, help="new folder in v2 format")
     ap.add_argument("--metadata_csv", required=True, help="splits CSV with scanner_key, manufacturer, group_raw, ...")
+    ap.add_argument("--meta_cols", nargs="*",
+                    default=["scanner_key", "manufacturer", "scanner", "site", "group", "group_raw", "sex"],
+                    help="columns taken from --metadata_csv")
     ap.add_argument("--hc_datasets", nargs="*", default=["hc-masivar"],
                     help="external datasets that are healthy controls -> role external_hc")
     args = ap.parse_args()
@@ -44,19 +47,37 @@ def main():
     n = len(idx)
     idx["_row"] = np.arange(n)
 
-    # ---- metadata from the splits CSV, matched on (dataset, image_uid), one row per scan ----
+    # ---- metadata from the splits CSV ----
+    # 1st pass: match on (dataset, image_uid); 2nd pass for scans still unmatched (v1 renamed some ids,
+    # e.g. MASiVar sessions <uid>_s0): match on (dataset, subject_id) -- valid for subject-level columns
+    # (group, sex) and, for one-scanner cohorts, the scanner. Columns the v1 index already has are only
+    # filled where they are empty.
     meta = pd.read_csv(args.metadata_csv)
-    keys = ["dataset", "image_uid"]
-    meta = meta.drop_duplicates(keys)
-    new_cols = [c for c in meta.columns if c not in idx.columns]
-    idx = idx.merge(meta[keys + new_cols], on=keys, how="left").drop_duplicates("_row").sort_values("_row")
-    idx = idx.reset_index(drop=True)
-    assert len(idx) == n
-    for c in ["scanner_key", "manufacturer", "group_raw"]:
-        if c in idx.columns:
-            print(f"[meta] {c}: filled for {idx[c].notna().mean():.0%} of scans")
-        else:
-            print(f"[meta] {c}: not in {args.metadata_csv}")
+    wanted = [c for c in args.meta_cols if c in meta.columns]
+    missing_cols = [c for c in args.meta_cols if c not in meta.columns]
+    if missing_cols:
+        print(f"[meta] not in {args.metadata_csv}: {missing_cols}")
+    for c in wanted:
+        if c not in idx.columns:
+            idx[c] = np.nan
+        idx[c] = idx[c].astype(object)
+    for keys in (["dataset", "image_uid"], ["dataset", "subject_id"]):
+        m = meta.drop_duplicates(keys).set_index(keys)[wanted]
+        k = pd.MultiIndex.from_frame(idx[keys].astype(str))
+        m.index = pd.MultiIndex.from_frame(m.index.to_frame().astype(str))
+        found = m.reindex(k)
+        for c in wanted:
+            empty = idx[c].isna().values
+            idx.loc[empty, c] = found[c].values[empty]
+    ext = idx.role.isin(["external_tbi", "external_hc"])
+    for c in wanted:
+        print(f"[meta] {c}: filled for {idx[c].notna().mean():.0%} of all scans, "
+              f"{idx.loc[ext, c].notna().mean():.0%} of external scans")
+    if "group_raw" in wanted:
+        tbi = idx.role.eq("external_tbi") & ~idx.dataset.isin(args.hc_datasets)
+        print("[meta] group_raw in the TBI cohorts:\n" +
+              idx[tbi].groupby(["dataset", idx.loc[tbi, "group_raw"].fillna("MISSING")]).size().to_string())
+    new_cols = wanted
 
     # ---- roles: healthy-control external cohorts -> external_hc ----
     hc = idx.dataset.isin(args.hc_datasets) & (idx.role == "external_tbi")
