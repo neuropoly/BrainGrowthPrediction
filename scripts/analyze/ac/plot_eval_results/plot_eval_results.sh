@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # ======================= EDIT THESE ==========================================
-EVAL_DIR=/home/andim/BrainGrowthPrediction/scripts/evaluate
+EVAL_DIR=/home/andim/BrainGrowthPrediction/scripts/analyze
 #   needs: plot_eval_results.py, dice_recon.py, plot_latents_by.py, eval_autoencoder.py (new versions)
 FOLDERS=(
   "$HOME/scratch/bgp/eval_all8"          # v1 main
