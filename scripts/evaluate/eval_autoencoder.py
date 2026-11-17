@@ -255,6 +255,9 @@ def group_probe(args, idx, feats):
     TBI cohorts? Group is confounded with cohort (Daufin ~all controls, Kaouenn mostly patients), so:
       pooled_latent        PCs, all external_tbi cohorts
       pooled_latent_ctr    PCs with cohort means removed (fold-wise, from training folds only)
+      pooled_latent_ctrlref PCs z-scored against each cohort's own CONTROLS (training fold): the usual
+                           way to pool clinical cohorts from different scanners
+      --group_adjust age sex: age (cubic) and sex regressed out of the PCs inside every training fold
       within_<cohort>      PCs, one cohort only (cohorts with >= group_min_per_class per class),
                            scanner means removed
       baselines            cohort+scanner one-hot only; age+sex only (pooled and per cohort)
@@ -283,8 +286,11 @@ def group_probe(args, idx, feats):
     sex_all = pd.to_numeric(idx.get("sex", pd.Series(np.nan, index=idx.index)), errors="coerce").fillna(0.5).values
     age_all = idx["age_bef_norm"].values.astype(float)
 
-    def cv_scores(X, y, groups, center=None, perm_strata=None, n_rep=None, n_perm=0):
-        """Out-of-fold balanced accuracy / AUC per CV repeat (+ permutation p on repeat 0's folds)."""
+    def cv_scores(X, y, groups, center=None, perm_strata=None, n_rep=None, n_perm=0, cov=None, ctrlref=None):
+        """Out-of-fold balanced accuracy / AUC per CV repeat (+ permutation p on repeat 0's folds).
+        cov:     covariates (e.g. age basis + sex) regressed out of X, fitted on the training fold only
+        center:  group labels whose means are removed (fitted on the training fold)
+        ctrlref: group labels; each group is z-scored with the mean/SD of its CONTROLS in the training fold"""
         n_rep = n_rep or args.group_repeats
         k = int(min(args.group_folds, np.bincount(y).min()))
         if k < 2:
@@ -293,11 +299,25 @@ def group_probe(args, idx, feats):
         def oof(yy, seed):
             score = np.zeros(len(yy))
             for trn, tst in StratifiedGroupKFold(k, shuffle=True, random_state=seed).split(X, yy, groups):
-                Xtr, Xte = X[trn], X[tst]
+                Xa = X
+                if cov is not None:                       # remove covariates, fit on training fold only
+                    from sklearn.linear_model import LinearRegression
+                    Xa = X - LinearRegression().fit(cov[trn], X[trn]).predict(cov)
+                fit = np.zeros(len(X), bool); fit[trn] = True
                 if center is not None:
-                    fit = np.zeros(len(X), bool); fit[trn] = True
-                    Xc = _center_by(X, center, fit)
-                    Xtr, Xte = Xc[trn], Xc[tst]
+                    Xa = _center_by(Xa, center, fit)
+                if ctrlref is not None:                   # z-score against own-cohort training controls
+                    Xa = Xa.copy()
+                    for g_ in np.unique(ctrlref):
+                        m_ = ctrlref == g_
+                        ref = m_ & fit & (yy == 0)
+                        if ref.sum() < 2:
+                            ref = m_ & fit
+                        if ref.sum() < 2:
+                            ref = fit
+                        mu, sd = Xa[ref].mean(0), Xa[ref].std(0) + 1e-6
+                        Xa[m_] = (Xa[m_] - mu) / sd
+                Xtr, Xte = Xa[trn], Xa[tst]
                 sc = StandardScaler().fit(Xtr)
                 clf = LogisticRegression(C=args.group_C, class_weight="balanced", max_iter=5000)
                 clf.fit(sc.transform(Xtr), yy[trn])
@@ -329,19 +349,30 @@ def group_probe(args, idx, feats):
                 "auc_lo": float(np.percentile(auc, 2.5)), "auc_hi": float(np.percentile(auc, 97.5)),
                 "perm_p_auc": p}
 
-    def run(tag, arm, mask, X, center=None, perm_strata="cohort"):
+    def run(tag, arm, mask, X, center=None, perm_strata="cohort", cov=None, ctrlref=None):
         y = y_all[mask]
         if np.bincount(y, minlength=2).min() < args.group_min_per_class:
             return
         strata = {"cohort": cohort_all, "scanner": scanner_all}.get(perm_strata)
         r = cv_scores(X, y, subj_all[mask], center=None if center is None else center[mask],
-                      perm_strata=None if strata is None else strata[mask], n_perm=args.group_n_perm)
+                      perm_strata=None if strata is None else strata[mask], n_perm=args.group_n_perm,
+                      cov=None if cov is None else cov[mask], ctrlref=None if ctrlref is None else ctrlref[mask])
         if r is None:
             return
         rows.append({"arm": arm, "analysis": tag, "n": int(mask.sum()), "n_case": int(y.sum()),
-                     "n_control": int((y == 0).sum()), **r})
+                     "n_control": int((y == 0).sum()),
+                     "adjusted_for": "+".join(adjust) if (cov is not None and arm != "-") else "", **r})
 
     rows = []
+    adjust = list(getattr(args, "group_adjust", []) or [])
+    cov_parts = []
+    if "age" in adjust:
+        cov_parts.append(age_basis(age_all))
+    if "sex" in adjust:
+        cov_parts.append(sex_all[:, None])
+    cov_all = np.hstack(cov_parts) if cov_parts else None
+    if adjust:
+        print(f"[group] latent features adjusted for {adjust} (fitted on each training fold)")
     cohorts = [c for c in sorted(np.unique(cohort_all[base]))
                if np.bincount(y_all[base & (cohort_all == c)], minlength=2).min() >= args.group_min_per_class]
 
@@ -350,6 +381,7 @@ def group_probe(args, idx, feats):
     agesex = np.c_[age_all, sex_all]
     run("baseline_cohort_scanner_only", "-", base, onehot[base])
     run("baseline_age_sex", "-", base, agesex[base])
+    run("baseline_age_sex_ctr", "-", base, agesex[base], center=cohort_all)     # reference for the centred panel
     for c in cohorts:
         m = base & (cohort_all == c)
         run(f"baseline_age_sex_within_{c}", "-", m, agesex[m], perm_strata="scanner")
@@ -358,11 +390,12 @@ def group_probe(args, idx, feats):
     n_pc = args.group_n_pcs
     for name in args.runs:
         P = feats[name][0][:, :n_pc]
-        run("pooled_latent", name, base, P[base])
-        run("pooled_latent_ctr", name, base, P[base], center=cohort_all)
+        run("pooled_latent", name, base, P[base], cov=cov_all)
+        run("pooled_latent_ctr", name, base, P[base], center=cohort_all, cov=cov_all)
+        run("pooled_latent_ctrlref", name, base, P[base], cov=cov_all, ctrlref=cohort_all)
         for c in cohorts:
             m = base & (cohort_all == c)
-            run(f"within_{c}", name, m, P[m], center=scanner_all, perm_strata="scanner")
+            run(f"within_{c}", name, m, P[m], center=scanner_all, perm_strata="scanner", cov=cov_all)
         print(f"[group] {name}")
     return pd.DataFrame(rows)
 
@@ -692,6 +725,8 @@ if __name__ == "__main__":
     ap.add_argument("--group_control", nargs="+", default=["CC", "OI", "control"],
                     help="labels merged into the control class (orthopedic injuries count as controls)")
     ap.add_argument("--group_n_pcs", default=20, type=int, help="first PCs used (small n: keep this low)")
+    ap.add_argument("--group_adjust", nargs="*", default=["age", "sex"], choices=["age", "sex"],
+                    help="covariates regressed out of the latent PCs in every training fold (none: --group_adjust)")
     ap.add_argument("--group_C", default=0.1, type=float, help="logistic regression inverse L2 strength")
     ap.add_argument("--group_folds", default=5, type=int)
     ap.add_argument("--group_repeats", default=20, type=int)
