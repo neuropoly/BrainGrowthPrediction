@@ -455,6 +455,37 @@ def s_volumes(args, idx, tbi, out, feats_holder):
         v = np.full(len(idx), np.nan)
         v[V.index.values] = rel[col].values
         tests += [dict(section="volumes", arm="volumetry", **r) for r in group_tests(f"vol_{col}", v, idx, tbi)]
+    # figure: standardised group effect (beta / residual SD) with 95% CI, every region, every contrast
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    T = pd.DataFrame(tests)
+    if len(T):
+        T["se"] = np.abs(T.effect / T.t.replace(0, np.nan))
+        regions = [f"vol_{c}" for c in rel.columns]
+        labels = [c.replace("total_brain_ml", "total brain") for c in rel.columns]
+        cons = [c for c in CONTRASTS if c in set(T.contrast)]
+        titles = {"mtbi_vs_controls": "mTBI vs CC + OI", "mtbi_vs_oi": "mTBI vs OI", "oi_vs_cc": "OI vs CC (negative control)"}
+        fig, axes = plt.subplots(1, len(cons), figsize=(4.3 * len(cons) + 1, 0.32 * len(regions) + 1.6),
+                                 sharey=True, squeeze=False)
+        for ax, cn in zip(axes[0], cons):
+            for off, scope, col, mk in [(-0.15, "pooled", "#2a78d6", "o"), (0.15, "within_koala", "#e0703a", "s")]:
+                d = T[(T.contrast == cn) & (T.scope == scope)].set_index("measure").reindex(regions)
+                yy = np.arange(len(regions)) + off
+                ax.errorbar(d.effect, yy, xerr=1.96 * d.se, fmt=mk, color=col, ms=4, lw=1, capsize=0,
+                            label=scope.replace("_", " "))
+            ax.axvline(0, color=INK, lw=1)
+            ax.set_yticks(range(len(regions))); ax.set_yticklabels(labels, fontsize=8)
+            ax.invert_yaxis()
+            ax.grid(axis="x", color=GRID, lw=0.7); ax.set_axisbelow(True)
+            style(ax, titles.get(cn, cn))
+            ax.set_xlabel("group effect (SD units, 95% CI)", fontsize=8.5)
+        axes[0, 0].legend(frameon=False, fontsize=8, loc="lower left")
+        fig.suptitle("Regional volume / total brain volume: case − control, adjusted for age, age², sex, cohort, scanner "
+                     "(uncorrected CIs)", fontsize=9.5, color=INK)
+        fig.tight_layout()
+        savefig(fig, out / "fig_volumes.png")
+
     # same supervised probe on the relative volumes (z-scored)
     F = np.zeros((len(idx), rel.shape[1]))
     Z = (rel - rel.mean()) / (rel.std() + 1e-9)
@@ -513,6 +544,27 @@ def s_time(args, idx, tbi, out, measures):
                          "axes (uncorrected p)", fontsize=9.5, color=INK)
             fig.tight_layout()
             savefig(fig, out / "fig_time_since_injury.png")
+        vols = [s_ for s_ in scat if s_[0] == "mTBI" and s_[1].startswith("volumetry|")]
+        if vols:
+            nc = 5
+            nr = int(np.ceil(len(vols) / nc))
+            fig, axes = plt.subplots(nr, nc, figsize=(3.0 * nc, 2.6 * nr), squeeze=False)
+            for ax, (gname, name, x, y, rho, p, cc) in zip(axes.ravel(), vols):
+                for cn, mk in COHORT_MARKERS.items():
+                    k_ = cc == cn
+                    if k_.any():
+                        ax.scatter(x[k_], y[k_], s=14, marker=mk, color=GROUP_COLORS["mTBI"], alpha=0.8,
+                                   edgecolors="white", linewidths=0.4)
+                style(ax, name.split("|")[-1].replace("vol_", "").replace("total_brain_ml", "total brain"),
+                      f"ρ={rho:.2f}, p={p:.3f}")
+                ax.title.set_fontsize(8.5)
+                ax.set_xlabel("days since injury (residual)", fontsize=7.5)
+            for ax in axes.ravel()[len(vols):]:
+                ax.axis("off")
+            fig.suptitle("mTBI: every regional volume vs time since injury (age + cohort + scanner removed; "
+                         "uncorrected p)", fontsize=9.5, color=INK)
+            fig.tight_layout()
+            savefig(fig, out / "fig_volumes_time.png")
     return tests
 
 
