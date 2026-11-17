@@ -34,7 +34,7 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
 grep -q "group_adjust" "$EVAL_DIR/eval_autoencoder.py" || { echo "[error] $EVAL_DIR/eval_autoencoder.py is an old version"; exit 1; }
 [ -f "$FOLDER/latent_index.csv" ] || { echo "[error] $FOLDER/latent_index.csv not found (run plot_results.sh first for v1)"; exit 1; }
 
-python "$ANALY_DIR/tbi_analysis.py" \
+python "$ANALY_DIR/analyze_tbi_cohorts.py" \
   --eval_dir "$FOLDER" \
   --metadata_csv "$META_CSV" \
   --eval_code "$EVAL_DIR" \
