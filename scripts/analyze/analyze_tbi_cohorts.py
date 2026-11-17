@@ -464,26 +464,35 @@ def s_volumes(args, idx, tbi, out, feats_holder):
 
 
 def s_time(args, idx, tbi, out, measures):
-    """measures: dict name -> array over idx rows. Partial Spearman with age removed, in mTBI and in OI."""
+    """measures: dict name -> array over idx rows. Partial Spearman in mTBI and in OI, with age, cohort and
+    scanner removed from both variables (time since injury differs by cohort: Koala ~40 days, Kaouenn ~90 days,
+    so without this the correlation mostly compares cohorts/scanners). Also within Koala alone."""
     from scipy.stats import spearmanr
     tests, scat = [], []
     age = idx.age_bef_norm.values.astype(float)
     tpi = idx.tpi_days.values.astype(float)
+    coh_all = idx.cohort.values
+    scan_all = idx.scanner_key.astype(str).values if "scanner_key" in idx else coh_all
     for gname in ["mTBI", "OI"]:
-        m = tbi & (idx.tbi_group.values == gname) & np.isfinite(tpi)
-        for name, v in measures.items():
-            v = np.asarray(v, float)
-            mm = m & np.isfinite(v)
-            if mm.sum() < 8:
-                continue
-            def resid(a):
-                X = np.column_stack([np.ones(mm.sum()), age[mm]])
-                return a - X @ np.linalg.lstsq(X, a, rcond=None)[0]
-            rho, p = spearmanr(resid(tpi[mm]), resid(v[mm]))
-            tests.append(dict(section="time", arm=name.split("|")[0], measure=name.split("|")[-1],
-                              contrast=f"time_since_injury_{gname}", scope="partial_spearman_age",
-                              effect=rho, p=p, n=int(mm.sum())))
-            scat.append((gname, name, tpi[mm], v[mm], rho, p))
+        for scope in ["pooled", "within_koala"]:
+            m = tbi & (idx.tbi_group.values == gname) & np.isfinite(tpi)
+            if scope == "within_koala":
+                m &= coh_all == "koala"
+            for name, v in measures.items():
+                v = np.asarray(v, float)
+                mm = m & np.isfinite(v)
+                if mm.sum() < 8:
+                    continue
+                Xc = np.column_stack([np.ones(mm.sum()), age[mm]] + dummies(coh_all[mm]) + dummies(scan_all[mm]))
+                def resid(a):
+                    return a - Xc @ np.linalg.lstsq(Xc, a, rcond=None)[0]
+                rx, ry = resid(tpi[mm]), resid(v[mm])
+                rho, p = spearmanr(rx, ry)
+                tests.append(dict(section="time", arm=name.split("|")[0], measure=name.split("|")[-1],
+                                  contrast=f"time_since_injury_{gname}", scope=f"{scope}_partial_age_cohort_scanner",
+                                  effect=rho, p=p, n=int(mm.sum())))
+                if scope == "pooled":
+                    scat.append((gname, name, rx, ry, rho, p, coh_all[mm]))
     if scat:
         import matplotlib
         matplotlib.use("Agg")
@@ -491,13 +500,17 @@ def s_time(args, idx, tbi, out, measures):
         top = sorted([s for s in scat if s[0] == "mTBI"], key=lambda s: s[5])[:6]
         if top:
             fig, axes = plt.subplots(1, len(top), figsize=(3.2 * len(top), 3), squeeze=False)
-            for ax, (gname, name, x, y, rho, p) in zip(axes[0], top):
-                ax.scatter(x, y, s=16, color=GROUP_COLORS["mTBI"], alpha=0.8, edgecolors="white", linewidths=0.4)
-                style(ax, name.split("|")[-1].replace("_", " "), f"ρ={rho:.2f}, p={p:.3f}")
-                ax.title.set_fontsize(8.5)
-                ax.set_xlabel("days since injury", fontsize=8)
-            fig.suptitle("mTBI: strongest associations with time since injury (age removed; uncorrected p)",
-                         fontsize=9.5, color=INK)
+            for ax, (gname, name, x, y, rho, p, cc) in zip(axes[0], top):
+                for cn, mk in COHORT_MARKERS.items():
+                    k_ = cc == cn
+                    if k_.any():
+                        ax.scatter(x[k_], y[k_], s=16, marker=mk, color=GROUP_COLORS["mTBI"], alpha=0.8,
+                                   edgecolors="white", linewidths=0.4)
+                style(ax, f"{name.split('|')[0]}: {name.split('|')[-1].replace('_', ' ')}", f"ρ={rho:.2f}, p={p:.3f}")
+                ax.title.set_fontsize(8)
+                ax.set_xlabel("days since injury (residual)", fontsize=8)
+            fig.suptitle("mTBI: strongest associations with time since injury, age + cohort + scanner removed from both "
+                         "axes (uncorrected p)", fontsize=9.5, color=INK)
             fig.tight_layout()
             savefig(fig, out / "fig_time_since_injury.png")
     return tests
