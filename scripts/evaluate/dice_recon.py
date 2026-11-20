@@ -13,14 +13,17 @@ Workflow
         <same folder>/<scan_id><seg_suffix>.nii.gz     (default suffix: _siamseg)
   3. python dice_recon.py --manifest eval/recon_manifest.csv --out_dir eval/dice --labels labels.json
 
-Every role in the manifest is its own group (test = internal, external_tbi, external_hc = MASiVar).
+Every role in the manifest is its own group: train / val / test (internal) and external_tbi,
+external_hc (MASiVar). To include training scans, save their reconstructions in step 1
+(--save_recon_roles train test ..., optionally --save_recon_max train=300).
 
 Outputs
   dice_per_scan_label.csv   one row per (run, scan, label)
   dice_per_scan.csv         one row per (run, scan): mean Dice / volume error over labels
   dice_summary.csv          per run x role: mean Dice and |rel. volume error|, 95% subject-bootstrap CI
   dice_summary_numeric.csv  same as numbers (mean, lo, hi) for plotting
-  dice_gap_vs_test.csv      per run x external role: external - internal test mean Dice, bootstrap CI
+  dice_gap_vs_test.csv      per run x other role: role - internal test mean Dice, bootstrap CI
+                            (train - test > 0 = the model reconstructs its training scans better)
   dice_per_label.csv        per run x role x label: mean Dice
   dice_per_site.csv         per run x role x dataset
   dice_paired_vs_<ref>.csv  paired difference vs the reference run; Wilcoxon on SUBJECT means
@@ -61,7 +64,9 @@ def boot_mean(vals, subjects, n_boot, rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True, help="recon_manifest.csv from eval_autoencoder.py")
+    ap.add_argument("--manifest", required=True,
+                    help="recon_manifest.csv from eval_autoencoder.py; an optional input_seg_path column "
+                         "overrides <input_path><suffix> as the input segmentation")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--seg_suffix", default="_siamseg",
                     help="segmentation of X.nii.gz is X<suffix>.nii.gz in the same folder")
@@ -84,8 +89,11 @@ def main():
     rng = np.random.default_rng(0)
 
     rows, missing, cache = [], [], {}
+    has_in_col = "input_seg_path" in man.columns     # e.g. native SIAM resampled onto the AE grid
     for r in man.itertuples():
-        s_in, s_rec = seg_path(r.input_path, args.seg_suffix), seg_path(r.recon_path, args.seg_suffix)
+        s_in = (r.input_seg_path if has_in_col and isinstance(r.input_seg_path, str)
+                else seg_path(r.input_path, args.seg_suffix))
+        s_rec = seg_path(r.recon_path, args.seg_suffix)
         miss = [w for w, p in (("input", s_in), ("recon", s_rec)) if not Path(p).exists()]
         if miss:
             missing.append({"arm": r.arm, "image_uid": r.image_uid, "role": r.role, "dataset": r.dataset,
@@ -128,8 +136,9 @@ def main():
     scan["subj"] = subj_key(scan)
     scan.to_csv(out / "dice_per_scan.csv", index=False)
 
-    roles = [r for r in [args.internal_role, "external_tbi", "external_hc"] if r in set(scan.role)] + \
-            sorted(set(scan.role) - {args.internal_role, "external_tbi", "external_hc"})
+    known = ["train", "val", args.internal_role, "external_tbi", "external_hc"]
+    known = list(dict.fromkeys(known))
+    roles = [r for r in known if r in set(scan.role)] + sorted(set(scan.role) - set(known))
     arms = list(dict.fromkeys(man.arm))           # manifest order = --runs order
 
     summ, summ_num, boots = [], [], {}
@@ -201,7 +210,7 @@ def main():
     pd.set_option("display.width", 220)
     print(summ.to_string(index=False))
     if len(gaps):
-        print(f"\nExternal - {args.internal_role} (mean Dice, 95% CI):\n", gaps.round(4).to_string(index=False))
+        print(f"\nRole - {args.internal_role} (mean Dice, 95% CI):\n", gaps.round(4).to_string(index=False))
     print("\nPer site:\n", per_site.to_string())
     if tests:
         print(f"\nPaired vs {ref}:\n", pd.DataFrame(tests).round(4).to_string(index=False))

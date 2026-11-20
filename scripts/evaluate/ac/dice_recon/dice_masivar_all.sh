@@ -17,12 +17,20 @@
 #      FIX_SHARED=1: re-encode just those scans with the NEW eval_autoencoder.py (file names
 #      <dataset>__<uid>, same v1 checkpoints) and swap them into the manifest.
 #      FIX_SHARED=0: leave them out.
-#   1. selected manifest + list of images to segment
-#   2. SIAM on every image without a segmentation yet (existing ones, e.g. the first 8 MASiVar
-#      scans, are reused; resubmit-safe)
-#   3. NEW dice_recon.py -> $OUT/dice/
-# MASiVar has role external_tbi in this run: dice_per_site.csv separates it from the TBI cohorts.
-# STAGE=fix | seg | dice | all
+#   1. selected manifest + list of images to segment: preprocessed INPUTS and RECONSTRUCTIONS
+#   1b. native SIAM segmentation (segm_path, *_siamseg.nii.gz) put on the autoencoder grid exactly
+#       like the image (Spacing 1.5 mm, ResizeWithPadOrCrop 120x144x120), NEAREST-neighbour
+#       (intensity scaling does not apply to a label map) -> $OUT/input_seg_aegrid/
+#   2. SIAM on every input and reconstruction without a segmentation yet (resubmit-safe)
+#   3. three Dice comparisons with dice_recon.py, each in its own folder:
+#        A  $DICE_DIR/A_siam_input_vs_recon     SIAM(preprocessed input) vs SIAM(recon)   <- primary
+#        B  $DICE_DIR/B_native_vs_recon         native SIAM, resampled   vs SIAM(recon)
+#        C  $DICE_DIR/C_ceiling_native_vs_input native SIAM, resampled   vs SIAM(preprocessed input)
+#           C = what a PERFECT reconstruction scores under B (resampling + resolution only)
+#      + $DICE_DIR/dice_ABC_by_label.csv: A, B, C side by side and B / C (share of the ceiling kept)
+#   Hausdorff / surface distances on the same three manifests: hausdorff_masivar_all.sh
+# MASiVar is relabelled external_hc here, so dice_summary.csv reports it separately.
+# STAGE=fix | inputseg | seg | dice | all   (DICE_SETS="A B C" to choose comparisons)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -37,6 +45,7 @@ REFERENCE=baseline_scratch
 N_BOOT=1000
 DATASETS="hc-masivar hc-daufin mtbi-kaouenn mtbi-koala"   # empty = everything in the manifest
 LABEL_SET=brain                                           # brain = labels 1-12, all = 1-16
+DICE_SETS=${DICE_SETS:-"A B C"}
 FIX_SHARED=1
 
 # the SAME v1 models as ae_masivar_all.sh
@@ -109,6 +118,7 @@ from pathlib import Path
 man_path, fix_dir, out, suf, datasets, fix = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5].split(), sys.argv[6] == "1"
 man = pd.read_csv(man_path)
 man["orig_image_uid"] = man.image_uid
+man.loc[man.dataset == "hc-masivar", "role"] = "external_hc"
 dup = man.duplicated(["arm", "image_uid"], keep=False)
 shared = sorted(man.loc[dup, "image_uid"].unique())
 man = man[~dup]                                           # the colliding v1 rows go in every case
@@ -126,7 +136,7 @@ if datasets:
     man = man[man.dataset.isin(datasets)]
 assert not man.duplicated(["arm", "image_uid"]).any()
 man.to_csv(f"{out}/recon_manifest_selected.csv", index=False)
-files = pd.unique(pd.concat([man.input_path, man.recon_path]))
+files = pd.unique(pd.concat([man.input_path, man.recon_path]))   # A and C need SIAM on the inputs
 seg = lambda p: p[:-7] + f"{suf}.nii.gz"
 todo = sum(not Path(seg(p)).exists() for p in files)
 pd.DataFrame({"img": files, "seg": [seg(p) for p in files]}).to_csv(f"{out}/seg_jobs.tsv", sep="\t", index=False, header=False)
@@ -135,13 +145,39 @@ print(f"[select] {man.image_uid.nunique()} scans x {man.arm.nunique()} runs; {le
 print(man.drop_duplicates("image_uid").groupby("dataset").size().to_string())
 PY
 
-# ---- 2. SIAM ----------------------------------------------------------------------------------
+# ---- 1b. input segmentations: native SIAM -> autoencoder grid --------------------------------
+INDEXES=("$OUT/latent_index.csv")
+[ -f "$FIX_DIR/latent_index.csv" ] && INDEXES=("$FIX_DIR/latent_index.csv" "${INDEXES[@]}")
+if run inputseg || run dice; then
+  python "$EVAL_DIR/resample_input_segs.py" \
+    --manifest "$DICE_DIR/recon_manifest_selected.csv" \
+    --index "${INDEXES[@]}" \
+    --out_dir "$OUT/input_seg_aegrid" \
+    --manifest_out "$DICE_DIR/manifest_B.csv"
+  # A = the selected manifest as is (no input_seg_path -> SIAM of the input);
+  # C = one row per scan: "reconstruction" = the input itself, reference = native resampled
+  python - "$DICE_DIR" <<'PY'
+import sys, pandas as pd
+d = sys.argv[1]
+a = pd.read_csv(f"{d}/recon_manifest_selected.csv")
+a.drop(columns=[c for c in ["input_seg_path"] if c in a.columns]).to_csv(f"{d}/manifest_A.csv", index=False)
+b = pd.read_csv(f"{d}/manifest_B.csv")
+c = b.drop_duplicates("image_uid").copy()
+c["arm"], c["recon_path"] = "ceiling", c["input_path"]
+c.to_csv(f"{d}/manifest_C.csv", index=False)
+print(f"[manifests] A {len(a)} rows | B {len(b)} rows ({b.input_seg_path.notna().mean():.0%} with a native "
+      f"segmentation) | C {len(c)} scans")
+PY
+fi
+
+# ---- 2. SIAM (reconstructions only) -----------------------------------------------------------
 if run seg; then
   deactivate; source $SIAM_VENV/bin/activate
   python "$EVAL_DIR/run_siam_batch.py" \
     --jobs "$DICE_DIR/seg_jobs.tsv" --siam_pred "$SIAM_PRED" --model "$SIAM_MODEL" \
     --chunk "$SIAM_CHUNK" --nbthread "$SIAM_NBTHREAD" --device cuda \
     --work_dir "${SLURM_TMPDIR:-$OUT/siam_tmp}"
+  deactivate; source $BGP_VENV/bin/activate
 fi
 
 # ---- 3. Dice ----------------------------------------------------------------------------------
@@ -154,10 +190,42 @@ model2 = {"GM": 1, "WM": 2, "CSF": 3, "CSFv": 4, "cerGM": 5, "Thal": 6, "Pal": 7
 top = 12 if sys.argv[2] == "brain" else 16
 json.dump({str(v): k for k, v in model2.items() if v <= top}, open(sys.argv[1], "w"), indent=1)
 PY
-  python "$EVAL_DIR/dice_recon.py" \
-    --manifest "$DICE_DIR/recon_manifest_selected.csv" --out_dir "$DICE_DIR" \
-    --seg_suffix "$SEG_SUFFIX" --labels "$LABELS_JSON" --reference "$REFERENCE" \
-    --internal_role test --n_boot "$N_BOOT"
+  declare -A NAME=([A]=A_siam_input_vs_recon [B]=B_native_vs_recon [C]=C_ceiling_native_vs_input)
+  for S in $DICE_SETS; do
+    echo "===== Dice $S: ${NAME[$S]} ====="
+    REF_ARG=(--reference "$REFERENCE"); [ "$S" = C ] && REF_ARG=()
+    python "$EVAL_DIR/dice_recon.py" \
+      --manifest "$DICE_DIR/manifest_$S.csv" --out_dir "$DICE_DIR/${NAME[$S]}" \
+      --seg_suffix "$SEG_SUFFIX" --labels "$LABELS_JSON" "${REF_ARG[@]}" \
+      --internal_role test --n_boot "$N_BOOT" | tee "$DICE_DIR/${NAME[$S]}.log"
+  done
+  # A, B, C side by side per model x role x label, and B / C = share of the achievable agreement
+  python - "$DICE_DIR" <<'PY'
+import sys, pandas as pd
+from pathlib import Path
+d = Path(sys.argv[1])
+def load(sub):
+    f = d / sub / "dice_per_scan_label.csv"
+    return pd.read_csv(f) if f.exists() else None
+A, B, C = load("A_siam_input_vs_recon"), load("B_native_vs_recon"), load("C_ceiling_native_vs_input")
+keys = ["arm", "role", "label_name"]
+out = None
+for tag, t in [("dice_A", A), ("dice_B", B)]:
+    if t is not None:
+        g = t.groupby(keys).dice.mean().rename(tag).reset_index()
+        out = g if out is None else out.merge(g, on=keys, how="outer")
+if C is not None and out is not None:
+    ceil = C.groupby(["role", "label_name"]).dice.mean().rename("dice_C_ceiling").reset_index()
+    out = out.merge(ceil, on=["role", "label_name"], how="left")
+    if "dice_B" in out:
+        out["B_over_C"] = out.dice_B / out.dice_C_ceiling
+if out is not None:
+    out.round(4).to_csv(d / "dice_ABC_by_label.csv", index=False)
+    pd.set_option("display.width", 200)
+    print("\nmean over labels (A, B, ceiling C, B/C):")
+    print(out.groupby(["arm", "role"])[[c for c in out.columns if c.startswith(("dice_", "B_over"))]]
+          .mean().round(3).to_string())
+PY
 fi
 
-echo "[done] $DICE_DIR: dice_summary.csv | dice_per_site.csv | dice_per_label.csv | dice_paired_vs_${REFERENCE}.csv"
+echo "[done] $DICE_DIR/{A_siam_input_vs_recon,B_native_vs_recon,C_ceiling_native_vs_input}/ + dice_ABC_by_label.csv"
