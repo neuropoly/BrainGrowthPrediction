@@ -41,8 +41,12 @@ def main():
     res, shape = args.resolution, args.shape
     if res is None or shape is None:
         from bgp import const
-        res = res or list(const.RESOLUTION)
-        shape = shape or list(const.INPUT_SHAPE_AE)
+        if res is None:                            # a single number (isotropic) or one per axis
+            r = const.RESOLUTION
+            res = [float(r)] * 3 if np.isscalar(r) else [float(x) for x in r]
+        if shape is None:
+            shape = [int(x) for x in np.atleast_1d(const.INPUT_SHAPE_AE)][-3:]   # drop a channel dim if any
+    print(f"[input seg] target grid: spacing {res} mm, shape {shape}")
     tf = transforms.Compose([
         transforms.LoadImage(image_only=True),
         transforms.EnsureChannelFirst(),
