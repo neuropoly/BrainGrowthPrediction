@@ -19,7 +19,7 @@
 #      FIX_SHARED=0: leave them out.
 #   1. selected manifest + list of images to segment: preprocessed INPUTS and RECONSTRUCTIONS
 #   1b. native SIAM segmentation (segm_path, *_siamseg.nii.gz) put on the autoencoder grid exactly
-#       like the image (Spacing 1.5 mm, ResizeWithPadOrCrop 120x144x120), NEAREST-neighbour
+#       like the image (Spacing 1.3 mm = bgp const.RESOLUTION, ResizeWithPadOrCrop 120x144x120), NEAREST-neighbour
 #       (intensity scaling does not apply to a label map) -> $OUT/input_seg_aegrid/
 #   2. SIAM on every input and reconstruction without a segmentation yet (resubmit-safe)
 #   3. three Dice comparisons with dice_recon.py, each in its own folder:
@@ -31,22 +31,25 @@
 #   Hausdorff / surface distances on the same three manifests: hausdorff_masivar_all.sh
 # MASiVar is relabelled external_hc here, so dice_summary.csv reports it separately.
 # STAGE=fix | inputseg | seg | dice | all   (DICE_SETS="A B C" to choose comparisons)
+# Same script for the INTERNAL v1 scans (eval_all8):
+#   OUT=$HOME/scratch/bgp/eval_all8 DATASETS="" FIX_SHARED=0 \
+#     sbatch --job-name=dice_all8 --output=logs/dice_all8_%j.out --error=logs/dice_all8_%j.err dice_masivar_all.sh
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
 # ======================= EDIT THESE ==========================================
 EVAL_DIR=/home/andim/BrainGrowthPrediction/scripts/evaluate   # NEW eval_autoencoder.py, dice_recon.py, run_siam_batch.py
-OUT=$HOME/scratch/bgp/eval_masivar_all
+OUT=${OUT:-$HOME/scratch/bgp/eval_masivar_all}
 DICE_DIR=$OUT/dice
 EXP_CSV=$OUT/splits_with_masivar.csv          # written by ae_masivar_all.sh (has the scans of this run)
 CACHE_DIR=$HOME/scratch/bgp/ae_cache
 SEG_SUFFIX=_siamseg
 REFERENCE=baseline_scratch
 N_BOOT=1000
-DATASETS="hc-masivar hc-daufin mtbi-kaouenn mtbi-koala"   # empty = everything in the manifest
+DATASETS=${DATASETS-"hc-masivar hc-daufin mtbi-kaouenn mtbi-koala"}   # DATASETS="" = everything in the manifest
 LABEL_SET=brain                                           # brain = labels 1-12, all = 1-16
 DICE_SETS=${DICE_SETS:-"A B C"}
-FIX_SHARED=1
+FIX_SHARED=${FIX_SHARED:-1}
 
 # the SAME v1 models as ae_masivar_all.sh
 B=$HOME/scratch/bgp/ae_midl
@@ -71,7 +74,7 @@ SIAM_VENV=/home/andim/venvs/siam
 module load StdEnv/2023
 module load python/3.11.5
 mkdir -p "$DICE_DIR" logs
-MANIFEST=$OUT/recon_manifest.csv
+MANIFEST=${MANIFEST:-$OUT/recon_manifest.csv}
 [ -f "$MANIFEST" ] || { echo "no $MANIFEST"; exit 1; }
 FIX_DIR=$OUT/fix_shared_ids
 run() { [ "$STAGE" = all ] || [ "$STAGE" = "$1" ]; }
@@ -170,7 +173,7 @@ print(f"[manifests] A {len(a)} rows | B {len(b)} rows ({b.input_seg_path.notna()
 PY
 fi
 
-# ---- 2. SIAM (reconstructions only) -----------------------------------------------------------
+# ---- 2. SIAM (inputs + reconstructions) -----------------------------------------------------------
 if run seg; then
   deactivate; source $SIAM_VENV/bin/activate
   python "$EVAL_DIR/run_siam_batch.py" \

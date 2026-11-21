@@ -19,7 +19,7 @@ set -euo pipefail
 
 # ======================= EDIT THESE ==========================================
 EVAL_DIR=/home/andim/BrainGrowthPrediction/scripts/evaluate   # hausdorff_recon.py
-OUT=$HOME/scratch/bgp/eval_masivar_all
+OUT=${OUT:-$HOME/scratch/bgp/eval_masivar_all}
 DICE_DIR=$OUT/dice
 SEG_SUFFIX=_siamseg
 LABEL_SET=brain
