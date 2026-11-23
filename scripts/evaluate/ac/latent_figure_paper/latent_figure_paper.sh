@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # ======================= EDIT THESE ==========================================
-ANALY_DIR=/home/andim/BrainGrowthPrediction/scripts/analyze        # where plot_latents_paper.py lives
+ANALY_DIR=/home/andim/BrainGrowthPrediction/scripts/evaluate        # where plot_latents_paper.py lives
 INTERNAL=$HOME/scratch/bgp/eval_all8
 EXTERNAL=$HOME/scratch/bgp/eval_masivar_all
 SPLITS=$EXTERNAL/splits_with_masivar.csv                           # only used if an index lacks age
