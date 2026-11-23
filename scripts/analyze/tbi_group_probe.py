@@ -1,8 +1,9 @@
 """Exploratory mTBI-vs-control probe on frozen latents, all nine models (fig:group-probe).
 
+Latents: each run folder holds latent_index.csv and latents_<arm>.npy (row i = row i of the index).
 Uses the v1 run folder that holds the re-encoded scans (eval_masivar_all): the Koala/Kaouenn
-scans whose image_uid collided (sub-1007, sub-1008, sub-1010) are taken from
-fix_shared_ids/latent_index.csv (image_uid = <dataset>__<uid>) instead of the colliding v1 files.
+scans whose image_uid is shared (sub-1007, sub-1008, sub-1010) are taken from fix_shared_ids/
+(latent_index.csv + latents_<arm>.npy, image_uid = <dataset>__<uid>) instead of the v1 rows.
 
 Analyses
   pooled      Daufin + Kaouenn + Koala
@@ -46,7 +47,6 @@ N_PC, C_REG, N_FOLD = 20, 0.1, 5
 N_REPEAT, N_PERM, N_REPEAT_PERM = 20, 500, 5
 SEED = 0
 BRAIN_LABELS = list(range(1, 13))                 # SIAM model 2: GM ... Hippo
-LATENT_KEY = "z_mu"
 GROUP_COLS = ["group", "diagnosis", "dx", "Group", "groupe"]
 SCANNER_COLS = ["scanner", "scanner_id", "site", "Scanner"]
 VOLUMES = "SIAM volumes"
@@ -57,39 +57,81 @@ def group_of(arm):
 
 
 # ============================================================================= data
-def read_index(path):
-    d = pd.read_csv(path)
-    pcol = next((c for c in ("latent_path", "z_path", "path") if c in d.columns), None)
-    if pcol is None:
-        raise SystemExit(f"{path}: no latent path column (columns: {list(d.columns)})")
-    d = d.rename(columns={pcol: "latent_path"})
-    if "orig_image_uid" not in d:
-        d["orig_image_uid"] = d.image_uid.astype(str).str.split("__").str[-1]
-    return d
+# A run folder (eval_all8, eval_masivar_all, fix_shared_ids/) holds latent_index.csv and one
+# latents_<arm>.npy per model; row i of every .npy is row i of latent_index.csv.
+_Z = {}
 
 
-def latent_index(eval_dir):
-    """Run index with the colliding Koala/Kaouenn rows replaced by fix_shared_ids/."""
-    idx = read_index(Path(eval_dir) / "latent_index.csv")
-    fix = Path(eval_dir) / "fix_shared_ids" / "latent_index.csv"
-    ndata = idx.groupby(["arm", "latent_path"]).dataset.transform("nunique")
-    collide = idx.dataset.isin(TBI_DATASETS) & (ndata > 1)
-    drop = collide.copy()
-    shared = sorted(set(idx.orig_image_uid[collide]))
-    if fix.exists():
-        new = read_index(fix)
-        keys = set(zip(new.dataset, new.orig_image_uid))
-        drop = drop | pd.Series([k in keys for k in zip(idx.dataset, idx.orig_image_uid)], index=idx.index)
-        idx = pd.concat([idx[~drop], new[idx.columns.intersection(new.columns)]], ignore_index=True)
-        print(f"[fix] replaced {shared} with {len(keys)} re-encoded scans from {fix}")
-    else:
-        idx = idx[~drop]
-        print(f"[fix] {fix} not found: leaving out {shared}")
+def load_run(folder):
+    folder = Path(folder)
+    idx = pd.read_csv(folder / "latent_index.csv")
+    ucol = next((c for c in ("image_uid", "scan_id") if c in idx.columns), None)
+    if ucol is None:
+        raise SystemExit(f"{folder}/latent_index.csv: no image_uid / scan_id column ({list(idx.columns)})")
+    idx = idx.rename(columns={ucol: "image_uid"})
+    idx["orig_image_uid"] = idx.image_uid.astype(str).str.split("__").str[-1]
+    idx["src"], idx["row"] = str(folder), np.arange(len(idx))
     return idx
 
 
+def zmat(src, arm):
+    """latents_<arm>.npy of a run folder, flattened to (n_scans, n_features); memory-mapped."""
+    if (src, arm) not in _Z:
+        z = np.load(Path(src) / f"latents_{arm}.npy", mmap_mode="r")
+        n = len(pd.read_csv(Path(src) / "latent_index.csv", usecols=[0]))
+        if z.shape[0] != n:
+            raise SystemExit(f"{src}/latents_{arm}.npy has {z.shape[0]} rows, latent_index.csv {n}")
+        _Z[(src, arm)] = z.reshape(z.shape[0], -1)
+    return _Z[(src, arm)]
+
+
+def get_z(rows, arm):
+    """Latents of the rows of an index (any mix of run folders), in row order."""
+    out = np.empty((len(rows), zmat(rows.src.iloc[0], arm).shape[1]), np.float32)
+    for src, g in rows.reset_index(drop=True).groupby("src"):
+        out[g.index] = np.asarray(zmat(src, arm)[g.row.to_numpy()], np.float32)
+    return out
+
+
+def available_arms(folder):
+    return [a for a in ARMS if (Path(folder) / f"latents_{a}.npy").exists()]
+
+
+def latent_index(eval_dir):
+    """Index of the run, TBI scans whose image_uid is shared by Koala and Kaouenn taken from
+    fix_shared_ids/ (re-encoded, image_uid = <dataset>__<uid>)."""
+    idx = load_run(eval_dir)
+    tbi = idx.dataset.isin(TBI_DATASETS)
+    nds = idx[tbi].groupby("orig_image_uid").dataset.nunique()
+    shared = sorted(nds[nds > 1].index)
+    fix = Path(eval_dir) / "fix_shared_ids"
+    if (fix / "latent_index.csv").exists():
+        new = load_run(fix)
+        new = new[new.dataset.isin(TBI_DATASETS)]
+        keys = set(zip(new.dataset, new.orig_image_uid))
+        drop = pd.Series([k in keys for k in zip(idx.dataset, idx.orig_image_uid)], index=idx.index)
+        idx = pd.concat([idx[~drop], new[idx.columns.intersection(new.columns)]], ignore_index=True)
+        print(f"[fix] shared uids {shared}: {int(drop.sum())} v1 rows replaced by {len(new)} re-encoded scans")
+        missing = [a for a in available_arms(eval_dir) if a not in available_arms(fix)]
+        if missing:
+            raise SystemExit(f"[fix] {fix} has no latents for {missing}")
+    elif shared:
+        a0 = available_arms(eval_dir)[0]
+        same = []
+        for u in shared:
+            r = idx[tbi & (idx.orig_image_uid == u)]
+            z = get_z(r, a0)
+            same.append(np.allclose(z[0], z[1:]))
+        print(f"[fix] no {fix}; shared uids {shared}; identical latents in both cohorts: {same}")
+        bad = [u for u, s_ in zip(shared, same) if s_]
+        idx = idx[~(tbi & idx.orig_image_uid.isin(bad))]
+        if bad:
+            print(f"[fix] leaving out {bad} (same latent stored for both cohorts)")
+    return idx.reset_index(drop=True)
+
+
 def build_table(idx, splits_csv, meta_csv):
-    """One row per (model, TBI scan): latent path, child, age, sex, segm path, group, scanner."""
+    """One row per TBI scan: index row, child, age, sex, native segm path, group, scanner."""
     t = idx[idx.dataset.isin(TBI_DATASETS)].copy()
     sp = pd.read_csv(splits_csv)
     sp = sp[sp.dataset.isin(TBI_DATASETS)].drop_duplicates(["dataset", "image_uid"])
@@ -98,7 +140,7 @@ def build_table(idx, splits_csv, meta_csv):
         sp[["dataset", "image_uid"] + keep].rename(columns={"image_uid": "orig_image_uid"}),
         on=["dataset", "orig_image_uid"], how="left")
     if t.subject_id.isna().any():
-        print(f"[warn] {t[t.subject_id.isna()].orig_image_uid.unique()} not in {splits_csv}")
+        print(f"[warn] not in {splits_csv}: {t[t.subject_id.isna()].orig_image_uid.tolist()}")
     m = pd.read_csv(meta_csv)
     gcol = next((c for c in GROUP_COLS if c in m.columns), None)
     if gcol is None:
@@ -106,36 +148,24 @@ def build_table(idx, splits_csv, meta_csv):
     scol = next((c for c in SCANNER_COLS if c in m.columns), None)
     m = m[["dataset", "subject_id", gcol] + ([scol] if scol else [])].drop_duplicates(["dataset", "subject_id"])
     m = m.rename(columns={gcol: "group", **({scol: "scanner"} if scol else {})})
-    t = t.merge(m, on=["dataset", "subject_id"], how="left")
+    t = t.drop(columns=[c for c in ("group", "scanner") if c in t.columns]).merge(
+        m, on=["dataset", "subject_id"], how="left")
     if t.group.isna().any():
-        print(f"[warn] no group for {t[t.group.isna()].drop_duplicates('subject_id')[['dataset', 'subject_id']].values.tolist()}; dropped")
+        print(f"[warn] no group for {t[t.group.isna()][['dataset', 'subject_id']].values.tolist()}; dropped")
         t = t[t.group.notna()]
     print("group values:", t.drop_duplicates(["dataset", "subject_id"]).groupby(["dataset", "group"]).size().to_dict())
     t["y"] = t.group.astype(str).str.lower().str.contains("tbi").astype(int)   # CC, OI -> control
     t["scanner"] = t.dataset + "|" + (t["scanner"].astype(str) if "scanner" in t else "")
     t["child"] = t.dataset + "|" + t.subject_id.astype(str)
-    t["age"] = t.get("age_bef_norm", np.nan)
+    t["age"] = t["age_bef_norm"] if "age_bef_norm" in t else np.nan
     return t.sort_values(["dataset", "subject_id", "orig_image_uid"]).reset_index(drop=True)
 
 
-def load_z(path):
-    p = str(path)
-    if p.endswith(".npz"):
-        f = np.load(p)
-        return np.asarray(f[LATENT_KEY] if LATENT_KEY in f.files else f[f.files[0]], np.float32).ravel()
-    if p.endswith(".npy"):
-        return np.load(p).astype(np.float32).ravel()
-    import torch
-    z = torch.load(p, map_location="cpu")
-    z = z[LATENT_KEY] if isinstance(z, dict) else z
-    return z.float().numpy().ravel()
-
-
-def latent_features(t_arm, train_arm):
-    Xtr = np.stack([load_z(p) for p in train_arm.latent_path])
+def latent_features(arm, t, train):
+    Xtr = get_z(train, arm)
     sc = StandardScaler().fit(Xtr)
     pca = PCA(N_PC, random_state=SEED).fit(sc.transform(Xtr))
-    return pca.transform(sc.transform(np.stack([load_z(p) for p in t_arm.latent_path])))
+    return pca.transform(sc.transform(get_z(t, arm)))
 
 
 def volume_features(t1):
@@ -285,8 +315,8 @@ def main():
     ap.add_argument("--eval_dir", required=True, help="eval_masivar_all (has fix_shared_ids/)")
     ap.add_argument("--splits_csv", required=True, help="splits_with_masivar.csv (subject_id, age, sex, segm_path)")
     ap.add_argument("--metadata_csv", required=True, help="external TBI metadata with the diagnostic group")
-    ap.add_argument("--train_index", default=None,
-                    help="latent_index.csv with the internal training scans (default: --eval_dir's own)")
+    ap.add_argument("--train_dir", default=None,
+                    help="run folder with the internal training latents (default: --eval_dir)")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--n_jobs", type=int, default=8)
     ap.add_argument("--n_perm", type=int, default=N_PERM)
@@ -298,17 +328,16 @@ def main():
         figure(pd.read_csv(out / "group_probe_results.csv"), str(out / "fig_group_probe")); return
 
     idx = latent_index(a.eval_dir)
-    t = build_table(idx, a.splits_csv, a.metadata_csv)
-    tr = read_index(a.train_index) if a.train_index else idx
-    tr = tr[tr.get("role", "") == "train"]
-    if tr.empty:
-        raise SystemExit("no internal training latents (role == 'train'): pass --train_index "
-                         "pointing to the run that encoded the training scans (e.g. eval_all8/latent_index.csv)")
-    arms = [x for x in ARMS if x in set(t.arm)]
-    print(f"models: {arms}")
+    t1 = build_table(idx, a.splits_csv, a.metadata_csv)
+    train = load_run(a.train_dir) if a.train_dir else idx
+    train = train[train.get("role", pd.Series("", index=train.index)) == "train"].reset_index(drop=True)
+    if train.empty:
+        raise SystemExit("no internal training scans (role == 'train') in the index: pass --train_dir "
+                         "pointing to the run that encoded them (e.g. $HOME/scratch/bgp/eval_all8)")
+    arms = [x for x in available_arms(a.eval_dir)
+            if x in available_arms(a.train_dir or a.eval_dir)]
+    print(f"models: {arms}; {len(train)} training scans for the PCA")
 
-    t1 = t[t.arm == arms[0]].reset_index(drop=True)          # one row per scan (same order for all arms)
-    uid = list(zip(t1.dataset, t1.orig_image_uid))
     counts = t1.drop_duplicates("child").groupby(["dataset", "y"]).size().unstack(fill_value=0)
     counts.columns = ["control" if c == 0 else "mTBI" for c in counts.columns]
     counts.loc["total"] = counts.sum()
@@ -318,8 +347,7 @@ def main():
 
     feats = {}
     for arm in arms:
-        ta = t[t.arm == arm].set_index(["dataset", "orig_image_uid"]).loc[uid].reset_index()
-        feats[arm] = latent_features(ta, tr[tr.arm == arm])
+        feats[arm] = latent_features(arm, t1, train)
         print(f"[features] {arm}: {feats[arm].shape}")
     if "segm_path" in t1 and t1.segm_path.notna().all():
         feats[VOLUMES] = volume_features(t1)
