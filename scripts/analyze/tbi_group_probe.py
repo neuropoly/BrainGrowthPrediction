@@ -141,21 +141,37 @@ def build_table(idx, splits_csv, meta_csv):
         on=["dataset", "orig_image_uid"], how="left")
     if t.subject_id.isna().any():
         print(f"[warn] not in {splits_csv}: {t[t.subject_id.isna()].orig_image_uid.tolist()}")
-    m = pd.read_csv(meta_csv)
+    m = pd.read_csv(meta_csv, na_values=["n/a", "N/A", ""])
+    idcol = next((c for c in ("participant_id", "subject_id", "subject") if c in m.columns), None)
     gcol = next((c for c in GROUP_COLS if c in m.columns), None)
-    if gcol is None:
-        raise SystemExit(f"no group column in {meta_csv}; columns: {list(m.columns)} -> edit GROUP_COLS")
-    scol = next((c for c in SCANNER_COLS if c in m.columns), None)
-    m = m[["dataset", "subject_id", gcol] + ([scol] if scol else [])].drop_duplicates(["dataset", "subject_id"])
-    m = m.rename(columns={gcol: "group", **({scol: "scanner"} if scol else {})})
-    t = t.drop(columns=[c for c in ("group", "scanner") if c in t.columns]).merge(
+    if idcol is None or gcol is None or "dataset" not in m.columns:
+        raise SystemExit(f"{meta_csv}: need dataset, a participant column and a group column; "
+                         f"columns: {list(m.columns)}")
+    m = m.rename(columns={idcol: "subject_id", gcol: "group"})
+    # scanner = MRI site + device serial number (scanner model if no serial); else a scanner column
+    if "mri_site" in m or "device_serial_number" in m:
+        site = m["mri_site"] if "mri_site" in m else pd.Series("site?", index=m.index)
+        serial = m["device_serial_number"] if "device_serial_number" in m else pd.Series(np.nan, index=m.index)
+        if "scanner_model" in m:
+            serial = serial.fillna(m["scanner_model"])
+        m["scanner"] = site.fillna("site?").astype(str) + "|" + serial.fillna("serial?").astype(str)
+    else:
+        scol = next((c for c in SCANNER_COLS if c in m.columns), None)
+        m["scanner"] = m[scol].astype(str) if scol else ""
+    if "original_group" not in m:
+        m["original_group"] = m["group"]
+    m = m[["dataset", "subject_id", "group", "original_group", "scanner"]].drop_duplicates(["dataset", "subject_id"])
+    t = t.drop(columns=[c for c in ("group", "original_group", "scanner") if c in t.columns]).merge(
         m, on=["dataset", "subject_id"], how="left")
     if t.group.isna().any():
         print(f"[warn] no group for {t[t.group.isna()][['dataset', 'subject_id']].values.tolist()}; dropped")
         t = t[t.group.notna()]
-    print("group values:", t.drop_duplicates(["dataset", "subject_id"]).groupby(["dataset", "group"]).size().to_dict())
+    kids = t.drop_duplicates(["dataset", "subject_id"])
+    print("children per cohort and group:", kids.groupby(["dataset", "group"]).size().to_dict())
+    print("group x original_group:", kids.groupby(["group", "original_group"]).size().to_dict())
+    print("Koala scanners:", kids[kids.dataset == KOALA].scanner.value_counts().to_dict())
     t["y"] = t.group.astype(str).str.lower().str.contains("tbi").astype(int)   # CC, OI -> control
-    t["scanner"] = t.dataset + "|" + (t["scanner"].astype(str) if "scanner" in t else "")
+    t["scanner"] = t.dataset + "|" + t["scanner"].fillna("").astype(str)
     t["child"] = t.dataset + "|" + t.subject_id.astype(str)
     t["age"] = t["age_bef_norm"] if "age_bef_norm" in t else np.nan
     return t.sort_values(["dataset", "subject_id", "orig_image_uid"]).reset_index(drop=True)
