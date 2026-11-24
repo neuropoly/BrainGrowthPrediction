@@ -28,7 +28,7 @@ SHOW_ROLES="test val"                                             # internal sca
 # vendor per scan: internal scan-level metadata + external participant-level metadata
 VENDOR_CSVS="/home/andim/projects/def-bedelb/andim/brlp-data/splits/datasets_splits_with_metadata.csv
              /home/andim/projects/def-bedelb/andim/brlp-data/splits_final/external_tbi_cohorts_metadata.csv"
-COHORT_VENDOR="hc-masivar=Philips"   # only fills scans still unknown after the tables
+COHORT_VENDOR="hc-masivar=Philips hc-new-england=Siemens"   # only fills scans still unknown after the tables
 BARS_BY=cohort                       # cohort | vendor  (what the neighbour bars are split by)
 # =============================================================================
 
