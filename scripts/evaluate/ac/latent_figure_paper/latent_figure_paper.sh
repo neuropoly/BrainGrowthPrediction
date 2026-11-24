@@ -26,7 +26,7 @@ OUT_DIR=$HOME/scratch/bgp/paper_figures
 ARMS="baseline_scratch baseline_pre frozen_pretrained"            # rows of the figure
 SHOW_ROLES="test val"                                             # internal scans drawn (add train for more)
 # vendor per scan: internal scan-level metadata + external participant-level metadata
-VENDOR_CSVS="/home/andim/projects/def-bedelb/andim/brlp-data/splits/datasets_splits_with_metadata.csv
+VENDOR_CSVS="/home/andim/projects/def-bedelb/andim/brlp-data/splits/datasets_all_final_meta.csv
              /home/andim/projects/def-bedelb/andim/brlp-data/splits_final/external_tbi_cohorts_metadata.csv"
 COHORT_VENDOR="hc-masivar=Philips hc-new-england=Siemens"   # only fills scans still unknown after the tables
 BARS_BY=cohort                       # cohort | vendor  (what the neighbour bars are split by)
