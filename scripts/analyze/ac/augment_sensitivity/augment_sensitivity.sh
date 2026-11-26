@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # ======================= EDIT THESE ==========================================
-ANALY_DIR=/home/andim/BrainGrowthPrediction/scripts/evaluate
+ANALY_DIR=/home/andim/BrainGrowthPrediction/scripts/analyze
 EVAL=$HOME/scratch/bgp/eval_all8_oldsplit
 OUT=$EVAL/aug_sensitivity
 B=$HOME/scratch/bgp/ae_midl
