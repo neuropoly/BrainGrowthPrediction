@@ -19,8 +19,14 @@ t-SNE is fitted on the shown internal scans (test + val by default) and all exte
 bars = share of neighbours from each internal cohort (top bar = share of each cohort in the
 training set, i.e. what a cohort-blind neighbour search would give).
 
+Site figure (fig_latents_sites.png, --site_col, default "site" from --vendor_csv): the same
+age-removed t-SNE with each external cohort split by acquisition site (e.g. KOALA at ACH vs CHUSJ),
+and the nearest-training-scan shares + distance ratio per external site (latent_neighbours_sites.csv).
+Question it answers: do scans from a site whose scanner model also occurs in training (KOALA-ACH:
+GE MR750w, like Calgary) sit with that training cohort, or elsewhere?
+
 Outputs (--out_dir): fig_latents.png/.pdf, latent_neighbours.csv (neighbour shares + distance
-ratio per external cohort and model), latent_neighbours_summary.txt
+ratio per external cohort and model), fig_latents_sites.png/.pdf, latent_neighbours_sites.csv
 """
 import argparse
 from pathlib import Path
@@ -88,6 +94,25 @@ def add_vendor(t, tables):
         t.loc[fill, "vendor"] = found[fill]
         print(f"[vendor] {path}: {int(fill.sum())} scans assigned")
     print("[vendor] scans per cohort and vendor:\n" + pd.crosstab(t.dataset, t.vendor).to_string())
+    return t
+
+
+def add_site(t, tables, col="site"):
+    """acquisition site per scan (scan-level tables: dataset + image_uid); 'unit' = cohort + site."""
+    t["site"] = np.nan
+    for path in tables or []:
+        m = pd.read_csv(path, na_values=["n/a", "N/A"])
+        if col not in m or "image_uid" not in m:
+            continue
+        v = m.drop_duplicates(["dataset", "image_uid"]).set_index(["dataset", "image_uid"])[col]
+        found = pd.Series([v.get(k, np.nan) for k in zip(t.dataset, t.orig_image_uid)], index=t.index)
+        t["site"] = t["site"].fillna(found)
+    t["site"] = t["site"].fillna("?").astype(str)
+    # external cohorts with more than one site are split; single-site cohorts keep their name
+    nsite = t[t.dataset.isin(EXTERNAL)].groupby("dataset").site.nunique()
+    t["unit"] = [f"{NAMES[d]} {s_}" if d in EXTERNAL and nsite.get(d, 1) > 1 else NAMES.get(d, d)
+                 for d, s_ in zip(t.dataset, t.site)]
+    print("[site] external units:\n" + t[t.dataset.isin(EXTERNAL)].groupby(["dataset", "unit"]).size().to_string())
     return t
 
 
@@ -179,6 +204,29 @@ def neighbours(P_res, t, k):
     rows.append({"cohort": "training mix", "external": False, "n": int(train.sum()), "distance_ratio": np.nan,
                  **{f"share_{s}": float(base.get(s, 0.0)) for s in sorted(set(tr_site))},
                  **{f"vendor_{v}": float(vbase.get(v, 0.0)) for v in sorted(set(tr_vendor))}})
+    return pd.DataFrame(rows)
+
+
+def neighbours_by_unit(P_res, t, k):
+    """as neighbours(), one row per external site unit (and per internal test cohort)."""
+    train = (t.role == "train").to_numpy()
+    nn = NearestNeighbors(n_neighbors=k).fit(P_res[train])
+    tr_site = t.dataset.to_numpy()[train]
+    test = (t.role == "test").to_numpy()
+    ref = np.median(nn.kneighbors(P_res[test])[0].mean(1))
+    rows = []
+    ext = t.dataset.isin(EXTERNAL).to_numpy()
+    for u in sorted(t.unit[ext].unique()):
+        m = ext & (t.unit == u).to_numpy()
+        dist, ind = nn.kneighbors(P_res[m])
+        share = pd.Series(tr_site[ind].ravel()).value_counts(normalize=True)
+        d0 = t.dataset[m].iloc[0]
+        rows.append({"unit": u, "cohort": d0, "site": t.site[m].iloc[0], "vendor": t.vendor[m].mode().iloc[0],
+                     "n": int(m.sum()), "distance_ratio": float(np.median(dist.mean(1)) / ref),
+                     **{f"share_{s_}": float(share.get(s_, 0.0)) for s_ in sorted(set(tr_site))}})
+    base = pd.Series(tr_site).value_counts(normalize=True)
+    rows.append({"unit": "training mix", "cohort": "training mix", "n": int(train.sum()), "distance_ratio": np.nan,
+                 **{f"share_{s_}": float(base.get(s_, 0.0)) for s_ in sorted(set(tr_site))}})
     return pd.DataFrame(rows)
 
 
@@ -280,6 +328,76 @@ def figure(res, t, arms, internal_order, out, bars_by="cohort"):
     print("saved", out)
 
 
+UNIT_MARKERS = ["^", "v", "s", "D", "P", "X", "<", ">"]
+
+
+def figure_sites(res_sites, t, arms, internal_order, out):
+    """per model: (a) age-removed t-SNE, internal scans faded by cohort, external scans by site unit;
+    (b) nearest-training-scan shares per external site unit (distance ratio on the right)."""
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 7, "pdf.fonttype": 42})
+    t_s = t[t.shown].reset_index(drop=True)
+    ext = t_s.dataset.isin(EXTERNAL).to_numpy()
+    units = [u for u in sorted(t_s.unit[ext].unique())]
+    cohort_of = t_s[ext].drop_duplicates("unit").set_index("unit").dataset
+    # colour by cohort, marker by site within the cohort
+    mk = {}
+    for d in EXTERNAL:
+        for j, u in enumerate(sorted(u for u in units if cohort_of[u] == d)):
+            mk[u] = UNIT_MARKERS[j % len(UNIT_MARKERS)]
+    n = len(arms)
+    fig, axg = plt.subplots(n, 2, figsize=(6.4, 2.3 * n + 0.6), squeeze=False,
+                            gridspec_kw={"width_ratios": [1, 1.05], "wspace": 0.45, "hspace": 0.2})
+    for r, arm in enumerate(arms):
+        xy_res, nb = res_sites[arm]
+        ax = axg[r, 0]
+        for d in internal_order:
+            m = (~ext) & (t_s.dataset == d).to_numpy()
+            ax.scatter(xy_res[m, 0], xy_res[m, 1], s=4, c=COLOR[d], alpha=0.35, lw=0, zorder=1)
+        for u in units:
+            m = ext & (t_s.unit == u).to_numpy()
+            ax.scatter(xy_res[m, 0], xy_res[m, 1], s=16, c=COLOR[cohort_of[u]], marker=mk[u],
+                       edgecolors=INK, linewidths=0.4, zorder=3)
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_color(GRID)
+        ax.set_ylabel(MODEL.get(arm, arm), fontsize=7.5, fontweight="bold", color=INK)
+        # bars
+        ax = axg[r, 1]
+        order = ["training mix"] + units
+        nbi = nb.set_index("unit").reindex(order)
+        for i, u in enumerate(order):
+            left = 0.0
+            for s_ in internal_order:
+                v = nbi.loc[u].get(f"share_{s_}", 0.0)
+                v = 0.0 if pd.isna(v) else v
+                ax.barh(i, v, left=left, color=COLOR[s_], height=0.7, lw=0)
+                left += v
+            if u != "training mix":
+                rr = nbi.loc[u]
+                ax.text(1.02, i, f"×{rr.distance_ratio:.2f}  n={int(rr.n)}  {rr.vendor}", va="center",
+                        fontsize=5.6, color=INK, transform=ax.get_yaxis_transform())
+        ax.set_yticks(range(len(order)), order, fontsize=6)
+        for tick, u in zip(ax.get_yticklabels(), order):
+            tick.set_color(COLOR.get(cohort_of.get(u, ""), INK))
+        ax.set_xlim(0, 1); ax.set_ylim(len(order) - 0.5, -0.5)
+        ax.set_xticks([0, 0.5, 1], ["0", "0.5", "1"], fontsize=5.8)
+        ax.axhline(0.5, color=INK, lw=0.5)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        if r == 0:
+            axg[0, 0].set_title("(a) age removed: external scans by site", fontsize=7, color=INK, loc="left")
+            axg[0, 1].set_title("(b) nearest training scans, by training cohort", fontsize=7, color=INK, loc="left")
+    h = [Line2D([], [], marker="o", ls="", ms=3.5, color=COLOR[d], alpha=0.6, label=NAMES[d]) for d in internal_order]
+    h += [Line2D([], [], marker=mk[u], ls="", ms=4.5, color=COLOR[cohort_of[u]], mec=INK, mew=0.4, label=u)
+          for u in units]
+    fig.legend(handles=h, loc="upper center", ncol=5, frameon=False, fontsize=6, bbox_to_anchor=(0.5, 1.0),
+               columnspacing=1.0, handletextpad=0.3)
+    fig.subplots_adjust(left=0.07, right=0.83, top=1 - 0.55 / (2.3 * n + 0.6), bottom=0.04)
+    for e_ in ("png", "pdf"):
+        fig.savefig(f"{out}.{e_}", dpi=600, bbox_inches="tight", pad_inches=0.03)
+    print("saved", out)
+
+
 # ============================================================================= main
 def main():
     ap = argparse.ArgumentParser()
@@ -297,6 +415,9 @@ def main():
     ap.add_argument("--bars_by", choices=["cohort", "vendor"], default="cohort")
     ap.add_argument("--cohort_vendor", nargs="*", default=[],
                     help="fallback for single-vendor cohorts still unknown, e.g. hc-masivar=Philips")
+    ap.add_argument("--site_col", default="site",
+                    help="column of the --vendor_csv tables used to split external cohorts by site "
+                         "(e.g. site, scanner_key); empty = no site figure")
     a = ap.parse_args()
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
 
@@ -308,10 +429,12 @@ def main():
         t.loc[fill, "vendor"] = v
         if fill.any():
             print(f"[vendor] {d}: {int(fill.sum())} unknown scans set to {v}")
+    if a.site_col:
+        t = add_site(t, a.vendor_csv, a.site_col)
     train = (t.role == "train").to_numpy()
     age = t.age_bef_norm.to_numpy(float)
     internal_order = [d for d in NAMES if d in set(t.dataset[train])]
-    res, rows = {}, []
+    res, rows, res_sites, rows_s = {}, [], {}, []
     for arm in a.arms:
         Z = get_z(t, arm)
         P, P_res = features(Z, train, age, a.n_pcs)
@@ -321,10 +444,18 @@ def main():
         nb = neighbours(P_res, t, a.k)
         res[arm] = (tsne(P), tsne(P_res), nb)
         rows.append(nb.assign(arm=arm))
+        if a.site_col:
+            nbs_ = neighbours_by_unit(P_res, t, a.k)
+            res_sites[arm] = (res[arm][1], nbs_)          # same age-removed t-SNE as panel (c)
+            rows_s.append(nbs_.assign(arm=arm))
+            print(f"[{arm}, by site]\n" + nbs_.round(2).to_string(index=False))
         print(f"[{arm}]\n" + nb.round(2).to_string(index=False))
     nbs = pd.concat(rows, ignore_index=True)
     nbs.round(4).to_csv(out / "latent_neighbours.csv", index=False)
     figure(res, t, a.arms, internal_order, str(out / "fig_latents"), a.bars_by)
+    if a.site_col:
+        pd.concat(rows_s, ignore_index=True).round(4).to_csv(out / "latent_neighbours_sites.csv", index=False)
+        figure_sites(res_sites, t, a.arms, internal_order, str(out / "fig_latents_sites"))
 
 
 if __name__ == "__main__":
