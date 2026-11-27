@@ -73,7 +73,7 @@ fi
 
 # ---- probe ----------------------------------------------------------------------------------
 ARGS=(--eval_dir "$EVAL" --splits_csv "$SPLITS" --metadata_csv "$META_CSV"
-      --out_dir "$OUT_DIR" --n_jobs "$NJ" --n_perm "$N_PERM")
+      --out_dir "$OUT_DIR" --n_jobs "$NJ" --n_perm "$N_PERM" --no_merge_daufin)
 [ "$PLOT_ONLY" = 1 ] && ARGS+=(--plot_only)
 python "$ANALY_DIR/tbi_group_probe.py" "${ARGS[@]}"
 

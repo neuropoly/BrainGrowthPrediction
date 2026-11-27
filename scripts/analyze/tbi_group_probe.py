@@ -27,6 +27,8 @@ mean and 95% interval over repeats. P-values: N_PERM permutations of child label
 Outputs (out_dir): group_probe_results.csv, group_probe_counts.csv, fig_group_probe.png/.pdf,
   fig_group_probe_<arm>.png/.pdf (one model, default baseline_pre: before vs after removing the cohort
   effect, with the reference classifiers and the permutation null range)
+  fig_group_probe_<arm>_compact.png/.pdf (same model, design of fig_group_probe: pooled | cohort means
+  removed, reference classifiers as vertical lines)
 """
 import argparse
 from pathlib import Path
@@ -397,6 +399,58 @@ def figure_one(res, arm, out, merged=True):
     print("saved", out)
 
 
+def figure_compact(res, arm, out):
+    """Same design as fig_group_probe, one model only: pooled | cohort means removed, with the reference
+    classifiers as vertical lines (dotted: age + sex only; dashed: cohort + scanner only)."""
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 7, "axes.linewidth": 0.6,
+                         "pdf.fonttype": 42})
+    panels = [("pooled", "Pooled (3 cohorts)"), ("cohort_adj", "Cohort means removed")]
+    nice = {"scratch": "from scratch", "pre": "fine-tuned", "frozen": "adult model as is"}[group_of(arm)]
+    col = COL[group_of(arm)]
+    fig, axes = plt.subplots(1, 2, figsize=(5.2, 1.5), sharey=True, gridspec_kw={"wspace": 0.12})
+    for ax, (key, title) in zip(axes, panels):
+        sub = res[res.analysis == key].set_index("features")
+        lo, hi = 0.3, 0.9
+        ax.set_xlim(lo, hi)
+        ax.axvspan(lo, 0.5, color="#F0EFEA", zorder=0, lw=0)
+        ax.axvline(0.5, color="#222222", lw=0.8, zorder=1)
+        refs = [(r, s_) for r, s_ in (("age + sex only", (0, (1, 1.5))), ("cohort + scanner only", (0, (4, 2))))
+                if r in sub.index]
+        refs = sorted(refs, key=lambda rs: sub.loc[rs[0], "auc"])
+        for k, (r, ls) in enumerate(refs):
+            v = sub.loc[r, "auc"]
+            ax.axvline(v, color="#444444", lw=0.8, ls=ls, zorder=1)
+            left = len(refs) > 1 and k == 0
+            ax.text(v + (-0.008 if left else 0.008), 1.02, f"{r.replace(' only', '')}\nonly: {v:.2f}",
+                    transform=ax.get_xaxis_transform(), ha="right" if left else "left", va="bottom",
+                    fontsize=5.8, color="#555555", linespacing=1.0)
+        if arm in sub.index:
+            r = sub.loc[arm]
+            sig = r.p_perm < 0.05
+            ax.plot([r.auc_lo, r.auc_hi], [0, 0], color=col, lw=1.2, zorder=2)
+            ax.plot(r.auc, 0, "o", ms=5, color=col, mfc=col if sig else "white", mew=1.0, zorder=3)
+            ax.text(r.auc, -0.32, f"{r.auc:.2f} (p = {r.p_perm:.3f})", ha="center", va="top", fontsize=5.8, color=col)
+        n = sub.iloc[0]
+        ax.set_title(f"{title}  (n = {int(n.n_scans)})", loc="left", fontweight="bold", fontsize=7.5, pad=24)
+        ax.set_xlabel("ROC AUC (range over CV repeats)", fontsize=6.3)
+        ax.grid(axis="x", color="#E4E4E4", lw=0.5, zorder=0)
+        for sp_ in ("top", "right", "left"):
+            ax.spines[sp_].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+        ax.tick_params(axis="x", labelsize=6)
+    axes[0].set_yticks([0], [f"latents ({nice})"], fontsize=6.5)
+    axes[0].get_yticklabels()[0].set_color(col)
+    axes[0].set_ylim(0.6, -0.7)
+    h = [Line2D([], [], marker="o", ls="", color="#555555", ms=4.6, label="permutation p < 0.05"),
+         Line2D([], [], marker="o", ls="", color="#555555", mfc="white", ms=4.6, label="p ≥ 0.05")]
+    fig.legend(handles=h, loc="lower center", ncol=2, frameon=False, fontsize=6.3, bbox_to_anchor=(0.6, -0.12))
+    fig.subplots_adjust(left=0.2, right=0.99, top=0.68, bottom=0.3)
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{out}.{ext}", dpi=600, bbox_inches="tight", pad_inches=0.03)
+    plt.close(fig)
+    print("saved", out)
+
+
 # ============================================================================= main
 def main():
     global N_PERM
@@ -421,6 +475,7 @@ def main():
         figure(res, str(out / "fig_group_probe"), merged)
         if a.single_arm:
             figure_one(res, a.single_arm, str(out / f"fig_group_probe_{a.single_arm}"), merged)
+            figure_compact(res, a.single_arm, str(out / f"fig_group_probe_{a.single_arm}_compact"))
         return
 
     idx = latent_index(a.eval_dir)
@@ -479,6 +534,7 @@ def main():
     figure(res, str(out / "fig_group_probe"), merged)
     if a.single_arm and a.single_arm in arms:
         figure_one(res, a.single_arm, str(out / f"fig_group_probe_{a.single_arm}"), merged)
+        figure_compact(res, a.single_arm, str(out / f"fig_group_probe_{a.single_arm}_compact"))
 
 
 if __name__ == "__main__":
