@@ -3,7 +3,7 @@
 #SBATCH --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
-#SBATCH --time=0-04:00
+#SBATCH --time=0-15:00
 #SBATCH --account=def-bedelb
 #SBATCH --output=logs/aug_sens_%j.out
 #SBATCH --error=logs/aug_sens_%j.err

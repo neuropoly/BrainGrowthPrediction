@@ -5,10 +5,15 @@ Uses the v1 run folder that holds the re-encoded scans (eval_masivar_all): the K
 scans whose image_uid is shared (sub-1007, sub-1008, sub-1010) are taken from fix_shared_ids/
 (latent_index.csv + latents_<arm>.npy, image_uid = <dataset>__<uid>) instead of the v1 rows.
 
+Cohorts: DAUFIN is the pilot study of KOALA (same team, same CHU Sainte-Justine scanner), so by default
+it is merged with KOALA into one cohort, "KOALA + DAUFIN" (--no_merge_daufin keeps them apart). The
+cohort is used for the cohort indicators, the cohort means removed and the permutation strata.
+
 Analyses
-  pooled      Daufin + Kaouenn + Koala
+  pooled      KOALA + DAUFIN + KAOUENN (all 84 children)
   cohort_adj  pooled, cohort means of the features removed using training folds only
-  koala       Koala only (scanner means removed in-fold if Koala has more than one scanner)
+              (two cohorts: KOALA + DAUFIN, KAOUENN)
+  koala       KOALA + DAUFIN only (scanner means removed in-fold; permutations within scanner)
 Feature sets
   latent, <model>   first N_PC principal components of the flattened z_mu (scaler + PCA fitted on
                     internal training scans of the same model), for all nine models
@@ -19,7 +24,9 @@ grouped by child, repeated N_REPEAT times; ROC AUC and balanced accuracy of out-
 mean and 95% interval over repeats. P-values: N_PERM permutations of child labels within cohort
 (within scanner for Koala), N_REPEAT_PERM repeats each.
 
-Outputs (out_dir): group_probe_results.csv, group_probe_counts.csv, fig_group_probe.png/.pdf
+Outputs (out_dir): group_probe_results.csv, group_probe_counts.csv, fig_group_probe.png/.pdf,
+  fig_group_probe_<arm>.png/.pdf (one model, default baseline_pre: before vs after removing the cohort
+  effect, with the reference classifiers and the permutation null range)
 """
 import argparse
 from pathlib import Path
@@ -37,6 +44,8 @@ from sklearn.preprocessing import StandardScaler
 
 TBI_DATASETS = ["hc-daufin", "mtbi-kaouenn", "mtbi-koala"]
 KOALA = "mtbi-koala"
+COHORT_MERGE = {"hc-daufin": "mtbi-koala"}         # DAUFIN = pilot of KOALA (same site and scanner)
+COHORT_NAME = {"mtbi-koala": "KOALA + DAUFIN", "mtbi-kaouenn": "KAOUENN", "hc-daufin": "DAUFIN"}
 ARMS = ["baseline_scratch", "aug_scratch", "adv_scratch", "aug_adv_scratch",
         "baseline_pre", "aug_pre", "adv_pre", "aug_adv_pre", "frozen_pretrained"]
 LABEL = {"baseline_scratch": "baseline", "aug_scratch": "aug", "adv_scratch": "adv",
@@ -130,7 +139,7 @@ def latent_index(eval_dir):
     return idx.reset_index(drop=True)
 
 
-def build_table(idx, splits_csv, meta_csv):
+def build_table(idx, splits_csv, meta_csv, merge_daufin=True):
     """One row per TBI scan: index row, child, age, sex, native segm path, group, scanner."""
     t = idx[idx.dataset.isin(TBI_DATASETS)].copy()
     sp = pd.read_csv(splits_csv)
@@ -170,8 +179,11 @@ def build_table(idx, splits_csv, meta_csv):
     print("children per cohort and group:", kids.groupby(["dataset", "group"]).size().to_dict())
     print("group x original_group:", kids.groupby(["group", "original_group"]).size().to_dict())
     print("Koala scanners:", kids[kids.dataset == KOALA].scanner.value_counts().to_dict())
+    print("Daufin scanners:", kids[kids.dataset == "hc-daufin"].scanner.value_counts().to_dict())
     t["y"] = t.group.astype(str).str.lower().str.contains("tbi").astype(int)   # CC, OI -> control
-    t["scanner"] = t.dataset + "|" + t["scanner"].fillna("").astype(str)
+    t["cohort"] = t.dataset.replace(COHORT_MERGE) if merge_daufin else t.dataset
+    # scanner keyed by cohort, so DAUFIN and KOALA scans from the same CHUSJ scanner share one level
+    t["scanner"] = t.cohort + "|" + t["scanner"].fillna("").astype(str)
     t["child"] = t.dataset + "|" + t.subject_id.astype(str)
     t["age"] = t["age_bef_norm"] if "age_bef_norm" in t else np.nan
     return t.sort_values(["dataset", "subject_id", "orig_image_uid"]).reset_index(drop=True)
@@ -251,10 +263,10 @@ def evaluate(analysis, name, kind, X, y, child, adjust, strata, seed):
 
 # ============================================================================= figure
 PANELS = [("pooled", "Pooled (3 cohorts)"), ("cohort_adj", "Cohort means removed"),
-          ("koala", "Koala only")]
+          ("koala", "KOALA + DAUFIN only")]
 
 
-def figure(res, out):
+def figure(res, out, merged=True):
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 7, "axes.linewidth": 0.6,
                          "pdf.fonttype": 42})
     rows, y = [], 0.0
@@ -266,6 +278,8 @@ def figure(res, out):
     ypos = dict(rows)
     fig, axes = plt.subplots(1, 3, figsize=(7.16, 3.3), sharey=True, gridspec_kw={"wspace": 0.12})
     for ax, (key, title) in zip(axes, PANELS):
+        if key == "koala" and not merged:
+            title = "KOALA only"
         sub = res[res.analysis == key].set_index("features")
         if sub.empty:
             ax.set_axis_off(); continue
@@ -324,6 +338,65 @@ def figure(res, out):
     print("saved", out)
 
 
+def figure_one(res, arm, out, merged=True):
+    """One model: classification before (pooled) and after removing the cohort effect, and within
+    KOALA + DAUFIN. Per analysis: the model's latents, SIAM volumes and the reference classifiers;
+    grey band = 95% range of the permutation null for the model's latents."""
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 7, "axes.linewidth": 0.6,
+                         "pdf.fonttype": 42})
+    within = "KOALA + DAUFIN only" if merged else "KOALA only"
+    panels = [("pooled", "Pooled, all cohorts"), ("cohort_adj", "Cohort means removed"), ("koala", within)]
+    nice = {"scratch": "from scratch", "pre": "fine-tuned", "frozen": "adult model as is"}[group_of(arm)]
+    nice = nice if LABEL.get(arm) in ("baseline", None) or group_of(arm) == "frozen" else f"{LABEL[arm]}, {nice}"
+    feats = [(arm, f"latents ({nice})", COL[group_of(arm)], "o"),
+             (VOLUMES, "SIAM volumes", COL["vol"], "D"),
+             ("cohort + scanner only", "cohort + scanner only", "#444444", "s"),
+             ("scanner only", "scanner only", "#444444", "s"),
+             ("age + sex only", "age + sex only", "#999999", "^")]
+    fig, ax = plt.subplots(figsize=(5.0, 3.4))
+    y, yt, yl = 0.0, [], []
+    for key, title in panels:
+        sub = res[res.analysis == key].set_index("features")
+        if arm not in sub.index:
+            continue
+        r0 = sub.loc[arm]
+        rows_here = [f for f in feats if f[0] in sub.index]
+        top = y
+        for name, lab, col, mk in rows_here:
+            r = sub.loc[name]
+            sig = r.p_perm < 0.05
+            ax.plot([r.auc_lo, r.auc_hi], [y, y], color=col, lw=1.2, zorder=2)
+            ax.plot(r.auc, y, marker=mk, ms=5 if mk == "o" else 4.4, color=col, mfc=col if sig else "white",
+                    mew=1.0, zorder=3)
+            ax.text(r.auc_hi + 0.012, y, f"{r.auc:.2f}" + (f"  p = {r.p_perm:.3f}" if name != "age + sex only" else ""),
+                    va="center", fontsize=5.8, color=col)
+            yt.append(y); yl.append(lab)
+            y += 1
+        ax.axhspan(top - 0.45, top + 0.45, xmin=0, xmax=1, color="none")
+        ax.fill_betweenx([top - 0.45, top + 0.45], r0.null_lo, r0.null_hi, color="#E6E4DE", zorder=0, lw=0)
+        ax.text(0.0, top - 0.75, f"{title}  (n = {int(r0.n_scans)}; {int(r0.n_mtbi)} mTBI / {int(r0.n_control)} ctrl)",
+                transform=ax.get_yaxis_transform(), fontsize=6.8, fontweight="bold", va="bottom")
+        y += 1.1
+    ax.axvline(0.5, color="#222222", lw=0.8, zorder=1)
+    ax.set_yticks(yt, yl, fontsize=6.3)
+    ax.set_ylim(y - 0.6, -1.3)
+    ax.set_xlim(0.25, 0.95)
+    ax.set_xlabel("ROC AUC (range over 20 CV repeats)", fontsize=6.5)
+    ax.grid(axis="x", color="#E4E4E4", lw=0.5, zorder=0)
+    for sp_ in ("top", "right", "left"):
+        ax.spines[sp_].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    h = [Line2D([], [], marker="o", ls="", color="#555555", ms=4.6, label="permutation p < 0.05"),
+         Line2D([], [], marker="o", ls="", color="#555555", mfc="white", ms=4.6, label="p ≥ 0.05"),
+         plt.Rectangle((0, 0), 1, 1, facecolor="#E6E4DE", label="95% permutation null (latents)")]
+    fig.legend(handles=h, loc="lower center", ncol=3, frameon=False, fontsize=6, bbox_to_anchor=(0.55, -0.02))
+    fig.subplots_adjust(left=0.27, right=0.97, top=0.97, bottom=0.17)
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{out}.{ext}", dpi=600, bbox_inches="tight", pad_inches=0.03)
+    plt.close(fig)
+    print("saved", out)
+
+
 # ============================================================================= main
 def main():
     global N_PERM
@@ -337,14 +410,21 @@ def main():
     ap.add_argument("--n_jobs", type=int, default=8)
     ap.add_argument("--n_perm", type=int, default=N_PERM)
     ap.add_argument("--plot_only", action="store_true", help="redraw from group_probe_results.csv")
+    ap.add_argument("--no_merge_daufin", action="store_true", help="keep DAUFIN as its own cohort")
+    ap.add_argument("--single_arm", default="baseline_pre", help="model of the single-model figure ('' = none)")
     a = ap.parse_args()
     N_PERM = a.n_perm
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
+    merged = not a.no_merge_daufin
     if a.plot_only:
-        figure(pd.read_csv(out / "group_probe_results.csv"), str(out / "fig_group_probe")); return
+        res = pd.read_csv(out / "group_probe_results.csv")
+        figure(res, str(out / "fig_group_probe"), merged)
+        if a.single_arm:
+            figure_one(res, a.single_arm, str(out / f"fig_group_probe_{a.single_arm}"), merged)
+        return
 
     idx = latent_index(a.eval_dir)
-    t1 = build_table(idx, a.splits_csv, a.metadata_csv)
+    t1 = build_table(idx, a.splits_csv, a.metadata_csv, merged)
     train = load_run(a.train_dir) if a.train_dir else idx
     train = train[train.get("role", pd.Series("", index=train.index)) == "train"].reset_index(drop=True)
     if train.empty:
@@ -360,6 +440,8 @@ def main():
     counts["scans"] = list(t1.groupby("dataset").size()) + [len(t1)]
     counts.to_csv(out / "group_probe_counts.csv")
     print(counts.to_string())
+    print("children per cohort used in the analyses:\n"
+          + t1.drop_duplicates("child").groupby(["cohort", "y"]).size().unstack(fill_value=0).to_string())
 
     feats = {}
     for arm in arms:
@@ -371,31 +453,32 @@ def main():
         print("[warn] no native segm_path for every scan: SIAM volume baseline skipped")
 
     y, child = t1.y.to_numpy(), t1.child.to_numpy()
-    k = (t1.dataset == KOALA).to_numpy()
+    coh = t1.cohort.to_numpy()                       # KOALA + DAUFIN merged unless --no_merge_daufin
+    k = (t1.cohort == KOALA).to_numpy()              # within-cohort analysis: KOALA (+ DAUFIN)
+    sc_ = t1.scanner.to_numpy()
     multi_scanner = t1[k].scanner.nunique() > 1
     agesex = t1[["age", "sex"]].to_numpy(float)
     jobs = []
     for name, X in feats.items():
         kind = "volumes" if name == VOLUMES else "latent"
-        jobs += [("pooled", name, kind, X, y, child, None, t1.dataset.to_numpy()),
-                 ("cohort_adj", name, kind, X, y, child, t1.dataset.to_numpy(), t1.dataset.to_numpy()),
-                 ("koala", name, kind, X[k], y[k], child[k],
-                  t1.scanner.to_numpy()[k] if multi_scanner else None, t1.scanner.to_numpy()[k])]
-    jobs += [("pooled", "age + sex only", "ref", agesex, y, child, None, t1.dataset.to_numpy()),
-             ("pooled", "cohort + scanner only", "ref", np.hstack([onehot(t1.dataset), onehot(t1.scanner)]),
-              y, child, None, t1.dataset.to_numpy()),
-             ("cohort_adj", "age + sex only", "ref", agesex, y, child, None, t1.dataset.to_numpy()),
-             ("koala", "age + sex only", "ref", agesex[k], y[k], child[k], None, t1.scanner.to_numpy()[k])]
+        jobs += [("pooled", name, kind, X, y, child, None, coh),
+                 ("cohort_adj", name, kind, X, y, child, coh, coh),
+                 ("koala", name, kind, X[k], y[k], child[k], sc_[k] if multi_scanner else None, sc_[k])]
+    jobs += [("pooled", "age + sex only", "ref", agesex, y, child, None, coh),
+             ("pooled", "cohort + scanner only", "ref", np.hstack([onehot(coh), onehot(sc_)]), y, child, None, coh),
+             ("cohort_adj", "age + sex only", "ref", agesex, y, child, None, coh),
+             ("koala", "age + sex only", "ref", agesex[k], y[k], child[k], None, sc_[k])]
     if multi_scanner:
-        jobs.append(("koala", "scanner only", "ref", onehot(t1.scanner[k]), y[k], child[k], None,
-                     t1.scanner.to_numpy()[k]))
+        jobs.append(("koala", "scanner only", "ref", onehot(sc_[k]), y[k], child[k], None, sc_[k]))
     print(f"[probe] {len(jobs)} analyses x {N_PERM} permutations on {a.n_jobs} cores")
     rows = Parallel(n_jobs=a.n_jobs, verbose=5)(
         delayed(evaluate)(*j, seed=SEED + i) for i, j in enumerate(jobs))
     res = pd.DataFrame(rows)
     res.round(4).to_csv(out / "group_probe_results.csv", index=False)
     print(res[["analysis", "features", "auc", "auc_lo", "auc_hi", "bacc", "p_perm"]].round(3).to_string(index=False))
-    figure(res, str(out / "fig_group_probe"))
+    figure(res, str(out / "fig_group_probe"), merged)
+    if a.single_arm and a.single_arm in arms:
+        figure_one(res, a.single_arm, str(out / f"fig_group_probe_{a.single_arm}"), merged)
 
 
 if __name__ == "__main__":

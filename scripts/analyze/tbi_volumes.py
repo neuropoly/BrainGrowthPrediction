@@ -25,8 +25,10 @@ Figures (--out_dir)
                                     (combined and KOALA); does the autoencoder keep the same differences?
   fig_volumes_concordance.png       native vs reconstructed group effect per region, one panel per arm
   fig_clinical_overview.png         age, time since injury, GCS, sex and scanner by cohort and group
-  fig_time_post_injury.png          per injured child: regional deviation from own-cohort controls
-                                    vs days since injury (native and one reconstruction)
+  fig_time_post_injury_ref<cc|all>.png  per injured child: regional deviation from the reference controls
+                                    vs days since injury (native and one reconstruction). --time_ref cc (default):
+                                    reference = community controls only, so OI children are tested against the
+                                    band like mTBI; time_post_injury_band.csv: share of CC / OI / mTBI within ±1, ±2 SD
 Tables: volumes_long.csv, volume_effects.csv, clinical_table.csv
 
 Usage
@@ -479,25 +481,49 @@ def fig_overview(t, out):
     print("saved", out)
 
 
-def deviations(w, t, src):
-    """per child: deviation of each region from CONTROLS, in control residual SD units. One model fitted on
-    all controls: share ~ cohort + age + age^2 + sex (cohort means absorb scanner/site offsets; KAOUENN has
-    only 5 controls, too few for a model of its own)."""
+def child_kind(t):
+    """CC (community control), OI (orthopaedic injury; KAOUENN 'control' = OI) or mTBI."""
+    g = t.group_raw.astype(str).str.lower()
+    return np.where(t.y == 1, "mTBI", np.where(g == "cc", "CC", "OI"))
+
+
+def deviations(w, t, src, ref="cc"):
+    """per child: deviation of each region from the reference controls, in their residual SD units.
+    One model fitted on the reference children: share ~ cohort + age + age^2 + sex.
+      ref="all": reference = CC + OI (cohort = dataset).
+      ref="cc":  reference = community controls only, so OI children are scored like the mTBI children and
+                 can be checked against the band. DAUFIN (KOALA pilot, same scanner) is merged with KOALA.
+                 KAOUENN has no CC: its cohort offset cannot be estimated, so its children are scored
+                 against KOALA + DAUFIN controls (their deviations include the cohort difference)."""
     d = w[w.source == src].merge(t, on=["dataset", "subject_id"]).reset_index(drop=True)
-    X = design(d, ["dataset"])
-    ref = (d.y == 0).values
+    d["kind"] = child_kind(d)
+    if ref == "cc":
+        d["coh"] = d.dataset.replace({"hc-daufin": "mtbi-koala"})
+        refm = (d.kind == "CC").values
+    else:
+        d["coh"] = d.dataset
+        refm = (d.y == 0).values
+    a = (d.age.values - 48) / 24
+    cols = [np.ones(len(d)), a, a ** 2, d.sex.fillna(d.sex.mean()).values]
+    ref_coh = sorted(set(d.coh[refm]))
+    cols += [(d.coh == c).values.astype(float) for c in ref_coh[1:]]   # cohorts without reference: offset 0
+    X = np.column_stack(cols)
+    no_ref = sorted(set(d.coh) - set(ref_coh))
+    if no_ref:
+        print(f"[time/{src}] no reference children in {no_ref}: scored against {ref_coh[0]} controls")
     out = []
     for r in REGIONS:
-        beta, *_ = np.linalg.lstsq(X[ref], d.loc[ref, r].values, rcond=None)
+        beta, *_ = np.linalg.lstsq(X[refm], d.loc[refm, r].values, rcond=None)
         res = d[r].values - X @ beta
-        sd = np.sqrt((res[ref] ** 2).sum() / (ref.sum() - np.linalg.matrix_rank(X[ref])))
+        sd = np.sqrt((res[refm] ** 2).sum() / (refm.sum() - np.linalg.matrix_rank(X[refm])))
         out.append(pd.DataFrame({"dataset": d.dataset, "subject_id": d.subject_id, "region": r, "z": res / sd,
-                                 "y": d.y, "group_raw": d.group_raw,
+                                 "y": d.y, "kind": d.kind, "group_raw": d.group_raw, "in_ref": refm,
+                                 "cohort_offset": ~d.coh.isin(no_ref),
                                  "days": d.get("time_post_injury_days", pd.Series(np.nan, index=d.index))}))
     return pd.concat(out, ignore_index=True)
 
 
-def fig_time(w, t, e, srcs, out, n_regions=4):
+def fig_time(w, t, e, srcs, out, n_regions=4, ref="cc"):
     if "time_post_injury_days" not in t or t.time_post_injury_days.notna().sum() < 5:
         print("[time] no time_post_injury_days: figure skipped")
         return None
@@ -506,10 +532,16 @@ def fig_time(w, t, e, srcs, out, n_regions=4):
     regions = list(g.sort_values(["q", "absz"], ascending=[True, False]).region.head(n_regions))
     fig, axes = plt.subplots(len(srcs), len(regions), figsize=(1.9 * len(regions), 1.8 * len(srcs)),
                              sharex=True, squeeze=False)
-    rows = []
+    rows, band = [], []
     for i, src in enumerate(srcs):
-        dv = deviations(w, t, src)
-        dv = dv[dv.days.notna()]
+        dv_all = deviations(w, t, src, ref)
+        for r in REGIONS:                           # how many children of each kind fall inside the band?
+            for kind, g in dv_all[dv_all.region == r].groupby("kind"):
+                band.append({"source": src, "region": r, "kind": kind, "n": len(g),
+                             "in_reference": bool(g.in_ref.all()), "mean_z": g.z.mean(),
+                             "within_1sd": (g.z.abs() <= 1).mean(), "within_2sd": (g.z.abs() <= 2).mean(),
+                             "kaouenn_without_offset": int((~g.cohort_offset).sum())})
+        dv = dv_all[dv_all.days.notna()]
         for j, r in enumerate(regions):
             ax = axes[i, j]
             d = dv[dv.region == r]
@@ -520,12 +552,15 @@ def fig_time(w, t, e, srcs, out, n_regions=4):
                 ax.scatter(dc.days[inj], dc.z[inj], s=10, color=CCOL[c], marker=CMARK[c], zorder=3)
                 ax.scatter(dc.days[~inj], dc.z[~inj], s=10, facecolors="white", edgecolors=CCOL[c],
                            marker=CMARK[c], lw=0.7, zorder=3)
-            m = d[d.y == 1]
-            if len(m) >= 5:
-                rho, p = stats.spearmanr(m.days, m.z)
-                ax.text(0.97, 0.95, f"mTBI ρ = {rho:.2f}\np = {p:.2f}", transform=ax.transAxes, ha="right", va="top",
-                        fontsize=5.5)
-                rows.append({"source": src, "region": r, "n_mtbi": len(m), "spearman_rho": rho, "p": p})
+            lines = []
+            for kind in ("mTBI", "OI"):
+                m = d[d.kind == kind]
+                if len(m) >= 5:
+                    rho, p = stats.spearmanr(m.days, m.z)
+                    lines.append(f"{kind} ρ = {rho:.2f} (p = {p:.2f})")
+                    rows.append({"source": src, "region": r, "kind": kind, "n": len(m), "spearman_rho": rho, "p": p,
+                                 "within_1sd": (m.z.abs() <= 1).mean()})
+            ax.text(0.97, 0.97, "\n".join(lines), transform=ax.transAxes, ha="right", va="top", fontsize=5.0)
             if i == 0:
                 ax.set_title(PRETTY[r], fontsize=7)
             if j == 0:
@@ -540,17 +575,25 @@ def fig_time(w, t, e, srcs, out, n_regions=4):
     h += [Line2D([], [], marker="o", ls="", color="#777777", label="mTBI"),
           Line2D([], [], marker="o", ls="", color="#777777", mfc="white", label="OI")]
     fig.legend(handles=h, loc="lower center", ncol=4, frameon=False, fontsize=6, bbox_to_anchor=(0.5, -0.04))
-    fig.suptitle("Deviation from controls (cohort, age, age², sex) vs time since injury; band = ±1 SD of controls",
-                 fontsize=7, color="#666666", x=0.01, ha="left")
+    if ref == "cc":
+        ttl = ("Deviation from community controls (CC; cohort, age, age², sex) vs time since injury; band = ±1 SD of CC. "
+               "OI and mTBI are both scored against CC; KAOUENN (no CC) against KOALA + DAUFIN CC")
+    else:
+        ttl = "Deviation from controls (CC + OI; cohort, age, age², sex) vs time since injury; band = ±1 SD of controls"
+    fig.suptitle(ttl, fontsize=6.2, color="#666666", x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0.04, 1, 0.95))
     fig.savefig(out, dpi=400, bbox_inches="tight")
     plt.close(fig)
     print("saved", out)
+    b = pd.DataFrame(band)
+    b.round(4).to_csv(Path(out).with_name("time_post_injury_band.csv"), index=False)
+    print("\nshare of children within ±1 SD of the reference (expected ~0.68 for the reference itself):\n"
+          + b.pivot_table(index=["source", "region"], columns="kind", values="within_1sd").round(2).to_string())
     return pd.DataFrame(rows)
 
 
 # ============================================================================= main
-def run(splits_csv, metadata_csv, recon_volumes_csv, out_dir, arms=None, time_src=None):
+def run(splits_csv, metadata_csv, recon_volumes_csv, out_dir, arms=None, time_src=None, time_ref="cc"):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 7, "axes.linewidth": 0.6, "pdf.fonttype": 42})
     t = clinical_table(splits_csv, metadata_csv)
@@ -582,7 +625,7 @@ def run(splits_csv, metadata_csv, recon_volumes_csv, out_dir, arms=None, time_sr
         conc.round(3).to_csv(out / "volume_concordance.csv", index=False)
         print(conc.round(3).to_string(index=False))
     tsrc = ["native"] + ([time_src] if time_src in sources else [a for a in arms if a in sources][:1])
-    tr = fig_time(w, t, e, tsrc, out / "fig_time_post_injury.png")
+    tr = fig_time(w, t, e, tsrc, out / f"fig_time_post_injury_ref{time_ref}.png", ref=time_ref)
     if tr is not None:
         tr.round(4).to_csv(out / "time_post_injury_correlations.csv", index=False)
 
@@ -600,5 +643,7 @@ if __name__ == "__main__":
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--arms", nargs="+", default=["baseline_scratch", "baseline_pre", "frozen_pretrained"])
     ap.add_argument("--time_src", default="baseline_pre", help="reconstruction shown next to native in the time figure")
+    ap.add_argument("--time_ref", default="cc", choices=["cc", "all"],
+                    help="reference of the deviations: community controls only (OI scored like mTBI) or CC + OI")
     a = ap.parse_args()
-    run(a.splits_csv, a.metadata_csv, a.recon_volumes, a.out_dir, a.arms, a.time_src)
+    run(a.splits_csv, a.metadata_csv, a.recon_volumes, a.out_dir, a.arms, a.time_src, a.time_ref)
